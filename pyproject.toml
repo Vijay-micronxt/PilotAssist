@@ -1,0 +1,29 @@
+[project]
+name = "pilot_assist"
+authors = [
+    { name = "MicroNXT", email = "helpdesk@micronxt.com"}
+]
+description = "AI chat assistant for ERPNext"
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["version"]
+dependencies = [
+    # "frappe~=15.0.0" # Installed and managed by bench.
+    "google-genai",
+    "anthropic",
+    "boto3",
+    "img2pdf",
+    "ocrmypdf",
+]
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "tab"
