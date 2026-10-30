@@ -102,7 +102,12 @@ function _ai_markdown_to_html(text) {
     const style = document.createElement('style');
     style.id = 'ai-modal-zfix';
     style.textContent = `
-        .modal-backdrop { z-index: 100000 !important; }
+        /* Scope the z-index bump to real Bootstrap dialog backdrops only.
+           Frappe's desk freeze overlay (used by the child-table row detail form
+           and elsewhere) is ALSO a .modal-backdrop but has id="freeze" — blanket
+           raising it to 100000 buries the detail form (z-index 1021) under the
+           overlay, producing a "frozen screen" on the grid pencil icon. Exclude it. */
+        .modal-backdrop:not(#freeze) { z-index: 100000 !important; }
         .modal { z-index: 100001 !important; }
         body.ai-modal-active .modal-dialog {
             position: fixed !important;
@@ -272,7 +277,7 @@ function open_ai_panel() {
 
             <!-- File upload -->
             <div style="margin-bottom:8px;">
-                <input type="file" class="ai-file-input" accept="image/*,application/pdf"
+                <input type="file" class="ai-file-input" accept="image/*,application/pdf" multiple
                     style="display:block;width:100%;padding:4px;border:1px solid #ddd;border-radius:4px;font-size:11px;background:white;">
                 <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
                     <div class="ai-file-preview" style="font-size:11px;color:#888;flex:1;"></div>
@@ -433,6 +438,15 @@ function open_ai_panel() {
 
     let is_ai_busy = false;
 
+    // Bulk upload: several invoices picked at once are queued here and sent to
+    // ask_document one at a time, each as its own isolated request.
+    const BULK_MAX_FILES = 10;
+    let bulk_files = [];
+    let bulk_run_active = false;
+    let bulk_cancel = false;
+    let bulk_run_id = 0;
+    let bulk_current_name = '';
+
     // Doc context — starts from current route, can be updated after doc creation
     const _initCtx = frappe.get_route();
     let active_doctype = (_initCtx && _initCtx[0] === 'Form' && _initCtx[1]) ? _initCtx[1] : null;
@@ -477,7 +491,7 @@ function open_ai_panel() {
                     </button>
                 </div>`;
             }
-            history.innerHTML += userHtml + `<div data-msg-id="${msg_id}" style="text-align:left;margin:5px 0;"><span style="background:#f0f0f0;padding:6px 10px;border-radius:10px;display:inline-block;">Thinking...</span></div>`;
+            history.insertAdjacentHTML('beforeend', userHtml + `<div data-msg-id="${msg_id}" style="text-align:left;margin:5px 0;"><span style="background:#f0f0f0;padding:6px 10px;border-radius:10px;display:inline-block;">Thinking...</span></div>`);
 
             if (!silent) {
                 const actionsRows = history.querySelectorAll('.ai-msg-actions');
@@ -515,7 +529,7 @@ function open_ai_panel() {
                 docname: current_docname,
                 image_data: image_data,
                 image_mime: image_mime,
-                history: JSON.stringify(conversation_history.slice(-6)),
+                history: JSON.stringify(bulk_run_active ? [] : conversation_history.slice(-6)),
                 selected_role: selected_ai_role
             },
             callback: function (r) {
@@ -529,7 +543,10 @@ function open_ai_panel() {
                         const mapped   = pi_data.mapped_data || {};
                         const items    = Array.isArray(mapped.items) ? mapped.items : [];
                         const taxes    = Array.isArray(mapped.taxes) ? mapped.taxes : [];
-                        const pid      = 'pip' + Date.now();
+                        const pid      = 'pip' + Date.now() + '_' + Math.floor(Math.random() * 1e6);
+                        const bulkCard = bulk_run_active;
+                        const bulkRun  = bulk_run_id;
+                        const bulkName = bulk_current_name;
 
                         // Separate regular items from packing/freight/service charges
                         const _chargeKws = ['packing','freight','transport','charge','charges','delivery','handling','loading','unloading','service','other','miscellaneous'];
@@ -636,6 +653,7 @@ function open_ai_panel() {
                                 <td style="padding:2px 3px;">
                                     <input data-f="item_name" value="${nm}"
                                         style="width:100%;font-size:11px;border:1px solid #e2e8f0;border-radius:3px;padding:2px 4px;box-sizing:border-box;">
+                                    <div class="${pid}-match" style="font-size:10px;margin-top:2px;"></div>
                                 </td>
                                 <td style="padding:2px 6px;font-size:11px;text-align:center;">${qty}</td>
                                 <td style="padding:2px 6px;font-size:11px;text-align:right;">${rate.toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
@@ -649,8 +667,8 @@ function open_ai_panel() {
                             const i   = items.indexOf(item);
                             const amt = parseFloat(item.qty||1) * parseFloat(item.rate||0);
                             const nm  = (item.item_name || item.item_code || item.description || '').replace(/</g,'&lt;');
-                            return `<tr class="${pid}-charge-row" data-idx="${i}">
-                                <td colspan="3" style="padding:3px 6px;font-size:11px;color:#94a3b8;font-style:italic;">${nm}</td>
+                            return `<tr class="${pid}-charge-row" data-idx="${i}" data-name="${nm.replace(/"/g, '&quot;')}">
+                                <td colspan="3" style="padding:3px 6px;font-size:11px;color:#94a3b8;font-style:italic;">${nm}<div class="${pid}-match" style="font-size:10px;margin-top:2px;font-style:normal;"></div></td>
                                 <td style="padding:2px 3px;text-align:right;">
                                     <input class="${pid}-charge-amt" type="number" value="${amt.toFixed(2)}" min="0" step="0.01"
                                         style="width:80px;font-size:11px;border:1px solid #e2e8f0;border-radius:3px;padding:2px 3px;text-align:right;color:#64748b;">
@@ -700,7 +718,7 @@ function open_ai_panel() {
                             </div>`;
 
                         const card = `
-                            <div style="background:#fff;border-radius:8px;padding:4px 0;" id="${pid}">
+                            <div class="${bulkCard ? 'ai-bulk-run-' + bulkRun : ''}" style="background:#fff;border-radius:8px;padding:4px 0;" id="${pid}">
                                 <div style="display:flex;${is_mobile_view ? 'flex-direction:column;' : ''}gap:10px;align-items:flex-start;margin-bottom:8px;">
                                     ${leftPanel}
                                     <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:6px;">
@@ -713,13 +731,22 @@ function open_ai_panel() {
                                 </div>
                                 <button class="ai-create-pi-btn"
                                     data-pi='${JSON.stringify(pi_data).replace(/'/g, "&#39;")}'
-                                    style="width:100%;padding:10px;font-size:13px;font-weight:600;background:#4f46e5;color:#fff;border:none;border-radius:6px;cursor:pointer;">
+                                    style="width:100%;padding:10px;font-size:13px;font-weight:600;background:#4f46e5;color:#fff;border:none;border-radius:6px;cursor:pointer;${bulkCard && is_mobile_view ? 'position:sticky;bottom:0;z-index:1;' : ''}">
                                     ✅ Create Purchase Invoice
                                 </button>
                             </div>`;
-                        if (el) el.innerHTML = card;
+                        if (el) {
+                            el.innerHTML = bulkCard
+                                ? _bulkItemHtml(bulkRun, card, {
+                                    billNo: billNo, supplier: supplier, grandTotal: grandTotal, name: bulkName,
+                                    warn: !!pi_data.validation_error || !supplier || !billNo || regularItems.length === 0
+                                })
+                                : card;
+                        }
 
                         const wrapper = document.getElementById(pid);
+                        if (bulkCard) _bulkBindItem(wrapper, bulkRun);
+                        _initItemMatching(wrapper, pid);
 
                         // Left panel toggle — switch between extracted fields and uploaded image
                         const toggleBtn = wrapper.querySelector(`#${pid}-toggle-left`);
@@ -792,12 +819,13 @@ function open_ai_panel() {
                                     item_name: tr.querySelector('[data-f="item_name"]').value,
                                     qty:  parseFloat(tr.dataset.qty)  || 1,
                                     rate: parseFloat(tr.dataset.rate) || 0,
+                                    matched_item_code: tr.dataset.matched || undefined,
                                 }));
                             });
                             wrapper.querySelectorAll(`.${pid}-charge-row`).forEach(tr => {
                                 const orig = (pi_data.mapped_data.items || [])[parseInt(tr.dataset.idx)] || {};
                                 const editedAmt = parseFloat(tr.querySelector(`.${pid}-charge-amt`).value) || 0;
-                                newItems.push(Object.assign({}, orig, { qty: 1, rate: editedAmt }));
+                                newItems.push(Object.assign({}, orig, { qty: 1, rate: editedAmt, matched_item_code: tr.dataset.matched || undefined }));
                             });
                             newMapped.items = newItems;
                             const newRegSub  = newItems.filter(it => !_isCharge(it)).reduce((s, it) => s + it.qty * it.rate, 0);
@@ -806,7 +834,7 @@ function open_ai_panel() {
                             newMapped.grand_total = Math.round((newBase + newBase * taxRate / 100) * 100) / 100;
 
                             const newPiData = Object.assign({}, pi_data, { mapped_data: newMapped });
-                            wrapper.querySelector('.ai-create-pi-btn').setAttribute('data-pi', JSON.stringify(newPiData).replace(/'/g,"&#39;"));
+                            wrapper.querySelector('.ai-create-pi-btn').setAttribute('data-pi', JSON.stringify(newPiData));
 
                             this.textContent = '✅ Applied!';
                             setTimeout(() => { this.style.display = 'none'; this.textContent = '🔄 Apply Changes'; }, 1200);
@@ -833,7 +861,8 @@ function open_ai_panel() {
                                             const warnDiv = document.createElement('div');
                                             warnDiv.style.cssText = 'margin-top:8px;padding:8px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:12px;color:#856404;';
                                             warnDiv.innerHTML = `⚠️ Could not create Purchase Invoice.<br>The following could not be matched in ERPNext:<br>${itemList}<br><br>Please add them first (or correct the name/spelling), then try again.`;
-                                            el.querySelector('div').appendChild(warnDiv);
+                                            wrapper.appendChild(warnDiv);
+                                            _bulkSetState(wrapper, 'warn', 'Items not matched in ERPNext. Open to fix.');
                                             return;
                                         }
 
@@ -843,7 +872,8 @@ function open_ai_panel() {
                                         const successDiv = document.createElement('div');
                                         successDiv.style.cssText = 'margin-top:8px;padding:8px;background:#d4f1c0;border-radius:6px;font-size:12px;';
                                         successDiv.innerHTML = `✅ Created: <strong>${name}</strong><br><a href="${url}" target="_blank" style="color:#4f46e5;">Click to open →</a>`;
-                                        el.querySelector('div').appendChild(successDiv);
+                                        wrapper.appendChild(successDiv);
+                                        _bulkSetState(wrapper, 'created', null, { name: name, url: url });
 
                                         // Set doc context for follow-up questions
                                         active_doctype = 'Purchase Invoice';
@@ -854,7 +884,7 @@ function open_ai_panel() {
                                         });
 
                                         // AI asks follow-up questions automatically (silent — no user bubble)
-                                        setTimeout(() => {
+                                        if (!bulkCard) setTimeout(() => {
                                             sendMessage(`Purchase Invoice ${name} was just created. Review the document and ask me 3 short follow-up questions about what I should verify or do next — like submitting, checking supplier, GST, or any missing fields. Keep it brief.`, true);
                                         }, 500);
                                     }
@@ -1321,8 +1351,10 @@ function open_ai_panel() {
                 }
 
                 history.scrollTop = history.scrollHeight;
-                conversation_history.push({ role: "user", content: message });
-                conversation_history.push({ role: "model", content: response_text });
+                if (!bulk_run_active) {
+                    conversation_history.push({ role: "user", content: message });
+                    conversation_history.push({ role: "model", content: response_text });
+                }
 
                 is_ai_busy = false;
                 if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; }
@@ -1348,7 +1380,7 @@ function open_ai_panel() {
         const msgInput = panel.querySelector('.ai-message-input');
         const message = msgInput.value.trim();
         if (!message) return;
-        sendMessage(message);
+        submitMessage(message);
     });
 
     // Enter key to send
@@ -1356,7 +1388,7 @@ function open_ai_panel() {
         if (e.key === 'Enter') {
             const message = this.value.trim();
             if (!message) return;
-            sendMessage(message);
+            submitMessage(message);
         }
     });
 
@@ -1444,7 +1476,7 @@ function open_ai_panel() {
                                 msgInputEl.placeholder = 'Type your message...';
                                 msgInputEl.disabled = false;
                                 if (r.message && r.message.trim()) {
-                                    sendMessage(r.message.trim());
+                                    submitMessage(r.message.trim());
                                 }
                             },
                             error: function () {
@@ -1475,17 +1507,401 @@ function open_ai_panel() {
     // Quick prompt buttons
     panel.querySelectorAll('.ai-suggestion-btn').forEach(btn => {
         btn.addEventListener('click', function () {
-            sendMessage(this.getAttribute('data-prompt'));
+            submitMessage(this.getAttribute('data-prompt'));
         });
     });
+
+    // ── Bulk invoice upload ──────────────────────────────────────────────────
+    // Several files picked at once are read one by one. Every file goes through
+    // the normal ask_document call on its own, so one failure never affects the
+    // others and the model never sees two invoices in the same request.
+    // Results are shown as one collapsed row per invoice (supplier, bill no,
+    // total, status); tapping a row opens that invoice's full preview card.
+    const _bulkEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+
+    function readFileAsBase64(blob) {
+        return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result.split(',')[1]);
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    // File area under the chat: counts only on a phone, counts + a short
+    // scrollable list on desktop, so ten files never squeeze the chat.
+    function renderBulkStatus() {
+        const preview = panel.querySelector('.ai-file-preview');
+        const icon = { waiting: '⏳', reading: '🔄', ready: '✅', failed: '⚠️' };
+        const count = s => bulk_files.filter(f => f.status === s).length;
+        const reading = bulk_files.find(f => f.status === 'reading');
+        const list = is_mobile_view ? '' :
+            `<div style="max-height:96px;overflow:auto;margin-top:2px;">` +
+            bulk_files.map(f => `<div>${icon[f.status] || ''} ${_bulkEsc(f.name)}</div>`).join('') + `</div>`;
+        preview.innerHTML =
+            `<div style="font-weight:600;">${bulk_files.length} files selected${reading ? '' : '. Type your message and press Send.'}</div>` +
+            (reading ? `<div>Reading: ${_bulkEsc(reading.name)}</div>` : '') +
+            `<div>⏳ ${count('waiting')} · 🔄 ${count('reading')} · ✅ ${count('ready')} · ⚠️ ${count('failed')}</div>` +
+            list;
+    }
+
+    async function loadBulkFiles(picked, inputEl, preview) {
+        let files = picked;
+        if (files.length > BULK_MAX_FILES) {
+            frappe.msgprint(`Only the first ${BULK_MAX_FILES} files are used at a time.`);
+            files = files.slice(0, BULK_MAX_FILES);
+        }
+        image_data = null;
+        image_mime = null;
+        preview.textContent = `Processing ${files.length} files...`;
+
+        const loaded = [];
+        for (const file of files) {
+            try {
+                if (file.type === 'application/pdf') {
+                    if (file.size > 10 * 1024 * 1024) {
+                        frappe.msgprint(`${_bulkEsc(file.name)}: PDF too large (max 10MB), skipped.`);
+                        continue;
+                    }
+                    loaded.push({ name: file.name, mime: 'application/pdf', data: await readFileAsBase64(file), status: 'waiting' });
+                } else if (file.type.startsWith('image/')) {
+                    const blob = await resizeImage(file);
+                    loaded.push({ name: file.name, mime: 'image/jpeg', data: await readFileAsBase64(blob), status: 'waiting' });
+                } else {
+                    frappe.msgprint(`${_bulkEsc(file.name)}: only images and PDFs are supported, skipped.`);
+                }
+            } catch (err) {
+                console.error('File error:', file.name, err);
+                frappe.msgprint(`${_bulkEsc(file.name)}: could not be processed, skipped.`);
+            }
+        }
+
+        if (loaded.length === 0) {
+            preview.textContent = '';
+            inputEl.value = '';
+            removeBtn.style.display = 'none';
+            return;
+        }
+        if (loaded.length === 1) {
+            // Only one usable file left: behave exactly like a normal single upload.
+            image_data = loaded[0].data;
+            image_mime = loaded[0].mime;
+            preview.textContent = `${loaded[0].mime === 'application/pdf' ? 'PDF' : 'Image'} ready: ${loaded[0].name}`;
+            removeBtn.style.display = 'inline-block';
+            return;
+        }
+        bulk_files = loaded;
+        renderBulkStatus();
+        removeBtn.style.display = 'inline-block';
+    }
+
+    // One collapsed row per invoice. The full preview card (photo, editable form,
+    // Create button) sits inside .ai-bulk-body and is unchanged.
+    function _bulkItemHtml(runId, cardHtml, info) {
+        const total = isFinite(info.grandTotal)
+            ? '₹ ' + Number(info.grandTotal).toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '';
+        const title = [info.billNo || 'No invoice no', info.supplier || 'Supplier not found'].map(_bulkEsc).join(' · ');
+        const sub = _bulkEsc(total) + (info.name ? ' · ' + _bulkEsc(info.name) : '') + (info.warn ? ' · check before creating' : '');
+        return `<div class="ai-bulk-item" data-run="${runId}" data-warn="${info.warn ? 1 : 0}" style="margin:6px 0;">
+            <div class="ai-bulk-row" style="display:flex;align-items:center;gap:8px;padding:8px 10px;min-height:44px;border:1px solid ${info.warn ? '#f59e0b' : '#e2e8f0'};border-radius:8px;background:#fff;cursor:pointer;">
+                <span class="ai-bulk-status" style="flex-shrink:0;font-size:15px;">${info.warn ? '⚠️' : '✅'}</span>
+                <span style="flex:1;min-width:0;">
+                    <div style="font-size:12px;font-weight:600;color:#1e293b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${title}</div>
+                    <div class="ai-bulk-sub" style="font-size:11px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${sub}</div>
+                </span>
+                <span class="ai-bulk-chev" style="flex-shrink:0;color:#94a3b8;">▸</span>
+            </div>
+            <div class="ai-bulk-body" style="display:none;margin-top:6px;">${cardHtml}</div>
+        </div>`;
+    }
+
+    // Tap a row to open its card; opening one closes the others of the same run.
+    function _bulkBindItem(wrapper, runId) {
+        const item = wrapper && wrapper.closest('.ai-bulk-item');
+        if (!item) return;
+        item.querySelector('.ai-bulk-row').addEventListener('click', function () {
+            const body = item.querySelector('.ai-bulk-body');
+            const opening = body.style.display === 'none';
+            panel.querySelectorAll(`.ai-bulk-item[data-run="${runId}"]`).forEach(other => {
+                other.querySelector('.ai-bulk-body').style.display = 'none';
+                other.querySelector('.ai-bulk-chev').textContent = '▸';
+            });
+            if (opening) {
+                body.style.display = 'block';
+                item.querySelector('.ai-bulk-chev').textContent = '▾';
+                item.scrollIntoView({ block: 'nearest' });
+            }
+        });
+    }
+
+    // Reflect what happened on the row itself (the card is usually folded).
+    function _bulkSetState(wrapper, state, text, created) {
+        const item = wrapper && wrapper.closest('.ai-bulk-item');
+        if (!item) return;
+        const row = item.querySelector('.ai-bulk-row');
+        const icon = item.querySelector('.ai-bulk-status');
+        const sub = item.querySelector('.ai-bulk-sub');
+        if (state === 'created') {
+            item.dataset.warn = '0';
+            item.dataset.created = '1';
+            icon.textContent = '✔️';
+            row.style.borderColor = '#22c55e';
+            sub.innerHTML = `Created <a href="${created.url}" target="_blank" onclick="event.stopPropagation()" style="color:#4f46e5;">${_bulkEsc(created.name)}</a>`;
+        } else if (state === 'warn') {
+            item.dataset.warn = '1';
+            icon.textContent = '⚠️';
+            row.style.borderColor = '#f59e0b';
+            sub.textContent = text;
+        }
+        _bulkRefreshBar(parseInt(item.dataset.run));
+    }
+
+    // Summary bar at the top of a run: progress while reading, then counts and
+    // the "Create all valid" button (rows needing attention are never included).
+    function _bulkRefreshBar(runId) {
+        const bar = document.getElementById('bulkbar' + runId);
+        if (!bar) return;
+        const items = panel.querySelectorAll(`.ai-bulk-item[data-run="${runId}"]`);
+        let ready = 0, warn = 0, created = 0;
+        items.forEach(i => {
+            if (i.dataset.created === '1') created++;
+            else if (i.dataset.warn === '1') warn++;
+            else ready++;
+        });
+        const total = parseInt(bar.dataset.total) || items.length;
+        const failed = parseInt(bar.dataset.failed) || 0;
+        const running = bar.dataset.running === '1';
+        const parts = [`${items.length} of ${total} read`];
+        if (created) parts.push(`${created} created`);
+        if (warn) parts.push(`${warn} need attention`);
+        if (failed) parts.push(`${failed} failed`);
+        bar.querySelector('.ai-bulk-bar-text').textContent =
+            (running ? 'Reading invoices... ' : '') + parts.join(' · ') + (running ? '' : '. Tap a row to review it.');
+        const btn = bar.querySelector('.ai-bulk-create-all');
+        btn.style.display = (!running && ready > 0) ? 'block' : 'none';
+        btn.disabled = bar.dataset.busy === '1';
+        btn.textContent = bar.dataset.busy === '1' ? 'Creating...' : `✅ Create all valid (${ready})`;
+    }
+
+    async function runBulk(message) {
+        if (bulk_run_active || !bulk_files.length) return;
+        while (is_ai_busy) await new Promise(r => setTimeout(r, 300));
+
+        const files = bulk_files.slice();
+        const history = panel.querySelector('.ai-chat-history');
+        const msgInput = panel.querySelector('.ai-message-input');
+        msgInput.value = '';
+
+        bulk_run_active = true;
+        bulk_cancel = false;
+        bulk_run_id += 1;
+        const runId = bulk_run_id;
+
+        const prevRetryBtn = history.querySelector('.ai-retry-btn');
+        if (prevRetryBtn) prevRetryBtn.remove();
+        history.insertAdjacentHTML('beforeend',
+            `<div style="text-align:right;margin:5px 0 1px;"><span style="background:#d4f1c0;padding:6px 10px;border-radius:10px;display:inline-block;max-width:85%;word-break:break-word;">${_bulkEsc(message)}<br><small>(${files.length} invoices)</small></span></div>`);
+
+        const barId = 'bulkbar' + runId;
+        history.insertAdjacentHTML('beforeend',
+            `<div id="${barId}" data-total="${files.length}" data-running="1" data-failed="0" data-busy="0" style="margin:8px 0;padding:8px 10px;background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;font-size:12px;">
+                <div class="ai-bulk-bar-text"></div>
+                <button class="ai-bulk-create-all" style="display:none;width:100%;min-height:40px;margin-top:6px;padding:8px;font-size:12px;font-weight:600;background:#4f46e5;color:#fff;border:none;border-radius:6px;cursor:pointer;"></button>
+            </div>`);
+        const bar = document.getElementById(barId);
+        bar.querySelector('.ai-bulk-create-all').addEventListener('click', function () {
+            const n = panel.querySelectorAll(`.ai-bulk-item[data-run="${runId}"]:not([data-warn="1"]):not([data-created="1"])`).length;
+            if (!n) return;
+            frappe.confirm(`Create ${n} Purchase Invoice${n > 1 ? 's' : ''} now? Nothing is submitted.`, async () => {
+                bar.dataset.busy = '1';
+                _bulkRefreshBar(runId);
+                await createAllInRun(runId);
+                bar.dataset.busy = '0';
+                _bulkRefreshBar(runId);
+            });
+        });
+        _bulkRefreshBar(runId);
+
+        let done = 0;
+        for (let i = 0; i < files.length; i++) {
+            if (bulk_cancel) break;
+            const f = files[i];
+            f.status = 'reading';
+            bulk_files = files;
+            renderBulkStatus();
+            history.insertAdjacentHTML('beforeend',
+                `<div style="text-align:left;margin:8px 0 0;font-size:11px;color:#64748b;">📎 Invoice ${i + 1} of ${files.length}: ${_bulkEsc(f.name)}</div>`);
+            history.scrollTop = history.scrollHeight;
+
+            image_data = f.data;
+            image_mime = f.mime;
+            bulk_current_name = f.name;
+            const before = history.querySelectorAll('.ai-bulk-run-' + runId).length;
+            sendMessage(message, true);
+            while (is_ai_busy) await new Promise(r => setTimeout(r, 300));
+            const after = history.querySelectorAll('.ai-bulk-run-' + runId).length;
+
+            f.status = after > before ? 'ready' : 'failed';
+            if (after > before) done++;
+            else bar.dataset.failed = String((parseInt(bar.dataset.failed) || 0) + 1);
+            renderBulkStatus();
+            _bulkRefreshBar(runId);
+        }
+
+        bulk_run_active = false;
+        image_data = null;
+        image_mime = null;
+        bulk_current_name = '';
+        bulk_files = [];
+        fileInput.value = '';
+        removeBtn.style.display = 'none';
+        panel.querySelector('.ai-file-preview').textContent = `Bulk upload finished: ${done} of ${files.length} read.`;
+        bar.dataset.running = '0';
+        _bulkRefreshBar(runId);
+        history.scrollTop = history.scrollHeight;
+    }
+
+    // Clicks each valid row's own Create button in turn and waits for it to finish
+    // (button removed on success, re-enabled on a warning), so every invoice goes
+    // through exactly the same create_purchase_invoice_from_data path as a single one.
+    async function createAllInRun(runId) {
+        const history = panel.querySelector('.ai-chat-history');
+        const buttons = Array.from(history.querySelectorAll(
+            `.ai-bulk-item[data-run="${runId}"]:not([data-warn="1"]):not([data-created="1"]) .ai-create-pi-btn`
+        )).filter(b => !b.disabled);
+        for (const b of buttons) {
+            b.click();
+            const started = Date.now();
+            await new Promise(resolve => {
+                const t = setInterval(() => {
+                    if (!document.body.contains(b) || !b.disabled || Date.now() - started > 120000) {
+                        clearInterval(t);
+                        resolve();
+                    }
+                }, 400);
+            });
+        }
+    }
+
+    function submitMessage(message) {
+        if (bulk_files.length > 1) { runBulk(message); return; }
+        sendMessage(message);
+    }
+
+    // ── Item mapping on the Purchase Invoice preview ─────────────────────────
+    // Every extracted item (and charge) name is compared with the ERPNext Item master
+    // (match_items) so it can be mapped BEFORE the invoice is created:
+    //   95% or more   found automatically
+    //   70% to 95%    dropdown of similar items to map to (best preselected from 80%)
+    //   below 70%     "not in system" - Create warns exactly as before
+    // The chosen Item code travels with the row as matched_item_code.
+    const _escAttr = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+
+    function _itemRowName(tr) {
+        const inp = tr.querySelector('[data-f="item_name"]');
+        return (inp ? inp.value : (tr.dataset.name || '')).trim();
+    }
+
+    // Write the current mapping of every row into the Create button's payload.
+    function _syncMatchesToPi(wrapper) {
+        const btn = wrapper.querySelector('.ai-create-pi-btn');
+        if (!btn) return;
+        let pi;
+        try { pi = JSON.parse(btn.getAttribute('data-pi')); } catch (e) { return; }
+        const items = (pi.mapped_data && pi.mapped_data.items) || [];
+        wrapper.querySelectorAll('tr[data-idx]').forEach(tr => {
+            const it = items[parseInt(tr.dataset.idx)];
+            if (!it) return;
+            if (tr.dataset.matched) it.matched_item_code = tr.dataset.matched;
+            else delete it.matched_item_code;
+        });
+        btn.setAttribute('data-pi', JSON.stringify(pi));
+    }
+
+    function _renderItemMatch(wrapper, pid, tr, res) {
+        const box = tr.querySelector(`.${pid}-match`);
+        if (!box) return;
+        delete tr.dataset.matched;
+        box.innerHTML = '';
+        if (!res) return;
+        const cands = res.candidates || [];
+        if (res.status === 'exact' && cands.length) {
+            tr.dataset.matched = cands[0].code;
+            box.style.color = '#16a34a';
+            box.textContent = '✓ In system: ' + cands[0].label;
+            return;
+        }
+        if (res.status === 'none' || !cands.length) {
+            box.style.color = '#dc2626';
+            box.textContent = 'Not in system (no similar item found)';
+            return;
+        }
+        box.style.color = '#b45309';
+        const opts = (res.status === 'suggest' ? '<option value="">Select the matching item...</option>' : '') +
+            cands.map((c, i) => `<option value="${_escAttr(c.code)}"${res.status === 'pick' && i === 0 ? ' selected' : ''}>${_escAttr(c.label)}</option>`).join('');
+        box.innerHTML = '<div>Not an exact match. Map it to an item in your system:</div>' +
+            `<select style="width:100%;font-size:11px;padding:2px 4px;margin-top:2px;border:1px solid #f59e0b;border-radius:3px;background:#fffbeb;">${opts}</select>`;
+        const sel = box.querySelector('select');
+        if (sel.value) tr.dataset.matched = sel.value;
+        sel.addEventListener('change', () => {
+            if (sel.value) tr.dataset.matched = sel.value;
+            else delete tr.dataset.matched;
+            _syncMatchesToPi(wrapper);
+        });
+    }
+
+    function _matchItemRows(wrapper, pid, rows) {
+        if (!rows.length) return;
+        frappe.call({
+            method: 'pilot_assist.api.ai_api.match_items',
+            args: { names: JSON.stringify(rows.map(_itemRowName)) },
+            callback: function (r) {
+                const results = (r && r.message) || [];
+                rows.forEach((tr, i) => _renderItemMatch(wrapper, pid, tr, results[i]));
+                _syncMatchesToPi(wrapper);
+                // in a bulk run, flag the invoice row so "Create all valid" leaves it for review
+                if (results.some(x => x && (x.status === 'none' || x.status === 'suggest'))) {
+                    _bulkSetState(wrapper, 'warn', 'Item not in system. Open to map or fix.');
+                }
+            },
+            error: function () {
+                rows.forEach(tr => { const b = tr.querySelector(`.${pid}-match`); if (b) b.textContent = ''; });
+            }
+        });
+    }
+
+    function _initItemMatching(wrapper, pid) {
+        const rows = Array.from(wrapper.querySelectorAll(`.${pid}-row, .${pid}-charge-row`));
+        rows.forEach(tr => {
+            const box = tr.querySelector(`.${pid}-match`);
+            if (box) { box.style.color = '#94a3b8'; box.textContent = 'Checking item...'; }
+        });
+        _matchItemRows(wrapper, pid, rows);
+        // an edited name is matched again (only that row, so other choices are kept)
+        wrapper.querySelectorAll('[data-f="item_name"]').forEach(inp => {
+            let timer = null;
+            inp.addEventListener('input', () => {
+                const tr = inp.closest('tr');
+                delete tr.dataset.matched;
+                _syncMatchesToPi(wrapper);
+                clearTimeout(timer);
+                timer = setTimeout(() => _matchItemRows(wrapper, pid, [tr]), 700);
+            });
+        });
+    }
 
     // File upload
     const fileInput = panel.querySelector('.ai-file-input');
     const removeBtn = panel.querySelector('.ai-file-remove');
 
     fileInput.addEventListener('change', async function (e) {
-        const file = e.target.files[0];
+        const picked = Array.from(e.target.files || []);
         const preview = panel.querySelector('.ai-file-preview');
+        bulk_files = [];
+        if (picked.length > 1) {
+            await loadBulkFiles(picked, e.target, preview);
+            return;
+        }
+        const file = picked[0];
         if (!file) { image_data = null; image_mime = null; preview.textContent = ''; removeBtn.style.display = 'none'; return; }
 
         preview.textContent = 'Processing...';
@@ -1528,6 +1944,8 @@ function open_ai_panel() {
     });
 
     removeBtn.addEventListener('click', function () {
+        bulk_files = [];
+        bulk_cancel = true;
         image_data = null;
         image_mime = null;
         fileInput.value = '';
@@ -1577,7 +1995,9 @@ async function resizeImage(file) {
         let url = URL.createObjectURL(file);
         img.onload = function () {
             let w = img.width, h = img.height;
-            let maxSize = 1024;
+            // 1568px is the longest side Claude reads at full detail; 1024 was too
+            // small for dense invoices (long GSTIN / IRN / e-way numbers got misread).
+            let maxSize = 1568;
             if (w > maxSize || h > maxSize) {
                 let ratio = Math.min(maxSize / w, maxSize / h);
                 w = Math.floor(w * ratio);
@@ -1587,7 +2007,7 @@ async function resizeImage(file) {
             canvas.width = w; canvas.height = h;
             canvas.getContext('2d').drawImage(img, 0, 0, w, h);
             URL.revokeObjectURL(url);
-            canvas.toBlob(resolve, 'image/jpeg', 0.8);
+            canvas.toBlob(resolve, 'image/jpeg', 0.88);
         };
         img.src = url;
     });

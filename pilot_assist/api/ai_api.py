@@ -1,12 +1,23 @@
+import time as _time
+
 import frappe
 from frappe import _
 
 
 _FUZZY_MATCH_THRESHOLD = 0.80
 
+# Item mapping on the Purchase Invoice preview (see match_items): at or above AUTO the
+# item counts as found; from SUGGEST up to AUTO the preview shows a dropdown of similar
+# items to map to; below SUGGEST the item is "not in the system".
+_ITEM_AUTO_THRESHOLD = 0.95
+_ITEM_SUGGEST_THRESHOLD = 0.70
+
 
 _GEMINI_MINUTE_COOLDOWN_SEC = 60
 _GEMINI_DAILY_COOLDOWN_SEC = 6 * 60 * 60
+
+_CLAUDE_MINUTE_COOLDOWN_SEC = 60
+_CLAUDE_BAD_KEY_COOLDOWN_SEC = 60 * 60
 
 
 def _ai_conf(key, default=None):
@@ -14,7 +25,13 @@ def _ai_conf(key, default=None):
     block:
         "enable_ai_assistant": {
             "enable_ai_chat": 1,
+            "ai_provider_chat": "deepseek",
+            "ai_provider_chat_model": "deepseek-chat",
+            "ai_provider_image": "claude",
+            "ai_provider_image_model": "claude-sonnet-5",
+            "max_tool_rounds": 6,
             "gemini_api_keys": ["...", "..."],
+            "claude_api_keys": ["...", "..."],
             "sarvam_api_key": "...",
             "enable_speech_to_text": 1,
             "enable_role_based_ai": 1,
@@ -23,6 +40,35 @@ def _ai_conf(key, default=None):
     All AI-related site config now lives under this one object instead of
     as flat top-level keys, so every reader goes through here."""
     return (frappe.conf.get("enable_ai_assistant") or {}).get(key, default)
+
+
+def _pick_ai_provider(has_image=False):
+    """Provider for this request: ai_provider_image when an image/PDF was
+    uploaded, otherwise ai_provider_chat. A missing ai_provider_image falls
+    back to the chat provider; a missing chat provider falls back to gemini."""
+    chat_provider = _ai_conf("ai_provider_chat") or "gemini"
+    if has_image:
+        return _ai_conf("ai_provider_image") or chat_provider
+    return chat_provider
+
+
+def _max_tool_rounds():
+    """How many times the AI may call a tool and read the result before it has
+    to answer. Default 6; override with enable_ai_assistant.max_tool_rounds."""
+    try:
+        return max(1, int(_ai_conf("max_tool_rounds") or 6))
+    except (TypeError, ValueError):
+        return 6
+
+
+def _pick_ai_model(has_image=False):
+    """Model override for this request: ai_provider_image_model for an
+    image/PDF upload, otherwise ai_provider_chat_model. None when not set —
+    the provider then uses its own setting (gemini_model, deepseek_model, ...)
+    and finally its built-in default, exactly as before. The image model never
+    falls back to the chat model: the two may belong to different providers."""
+    key = "ai_provider_image_model" if has_image else "ai_provider_chat_model"
+    return _ai_conf(key) or None
 
 
 def _mcp_url():
@@ -387,8 +433,12 @@ def _gemini_tools(include_preview=False):
     return [types.Tool(function_declarations=declarations)]
 
 
-def _claude_tools():
-    return [{"name": s["name"], "description": s["description"], "input_schema": _to_json_schema(s)} for s in _TOOL_SPECS]
+def _claude_tools(include_preview=False):
+    return [
+        {"name": s["name"], "description": s["description"], "input_schema": _to_json_schema(s)}
+        for s in _TOOL_SPECS
+        if include_preview or s["name"] not in _PREVIEW_TOOL_NAMES
+    ]
 
 
 def _oai_tools():
@@ -594,12 +644,77 @@ def _gemini_mark_rate_limited(api_key, error):
     frappe.cache().set_value(_gemini_cooldown_cache_key(api_key), 1, expires_in_sec=cooldown_sec)
 
 
+_GEMINI_CLIENTS = {}
+_GEMINI_DEFAULT_TIMEOUT_SEC = 60
+
+
+def _ai_logger():
+    """logs/ai_assistant.log. frappe's loggers default to WARNING, which would
+    silently drop the timing lines, so the level is raised to INFO here."""
+    import logging
+
+    logger = frappe.logger("ai_assistant")
+    logger.setLevel(logging.INFO)
+    return logger
+
+
+def _log_ai_timing(label, started, **extra):
+    """One line per slow-prone step in logs/ai_assistant.log, so a slow request
+    can be traced to the exact step (image conversion, a Gemini round, an MCP
+    call) instead of guessed at. `started` is a time.perf_counter() reading."""
+    details = "".join(f" {k}={v}" for k, v in extra.items())
+    _ai_logger().info(f"{label}: {_time.perf_counter() - started:.2f}s{details}")
+
+
+def _gemini_timeout_ms():
+    try:
+        sec = int(_ai_conf("gemini_timeout_sec") or _GEMINI_DEFAULT_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        sec = _GEMINI_DEFAULT_TIMEOUT_SEC
+    return max(10, sec) * 1000
+
+
+def _gemini_client(api_key):
+    """One client per key per worker process, reused across rounds and requests
+    (a new client per call meant a fresh connection every round). Carries a
+    request timeout so a stalled Gemini call can't hold the request open."""
+    from google import genai
+    from google.genai import types
+
+    timeout_ms = _gemini_timeout_ms()
+    cached = _GEMINI_CLIENTS.get(api_key)
+    if cached and cached[0] == timeout_ms:
+        return cached[1]
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_ms))
+    _GEMINI_CLIENTS[api_key] = (timeout_ms, client)
+    return client
+
+
+def _gemini_generate_one_key(api_key, model, contents, config):
+    """generate_content on one key. A 5xx from Google (the 503 "high demand"
+    case) is retried once; a timeout becomes a clear message instead of a hang.
+    4xx errors (including 429) are raised untouched for the rotation logic."""
+    from google.genai import errors as genai_errors
+
+    for attempt in (1, 2):
+        try:
+            return _gemini_client(api_key).models.generate_content(model=model, contents=contents, config=config)
+        except genai_errors.ServerError:
+            if attempt == 1:
+                _ai_logger().warning("Gemini 5xx, retrying once")
+                continue
+            frappe.throw(_("The AI service is overloaded right now. Please try again in a moment."))
+        except Exception as e:
+            if type(e).__name__ in ("ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout", "TimeoutException"):
+                frappe.throw(_("The AI service took too long to respond. Please try again."))
+            raise
+
+
 def _gemini_generate_with_rotation(keys, model, contents, config):
     """Try each configured key in turn, skipping ones currently resting.
     Only rotates on a 429/RESOURCE_EXHAUSTED response — any other error
     (bad key, network issue, etc.) is raised immediately, since switching
     keys wouldn't fix those."""
-    from google import genai
     from google.genai import errors as genai_errors
 
     # Single key — no pool to switch within, so skip the cooldown check/mark
@@ -609,8 +724,7 @@ def _gemini_generate_with_rotation(keys, model, contents, config):
     # could even block a call that would've actually succeeded if a prior
     # cooldown estimate turns out to have been overly conservative.
     if len(keys) == 1:
-        client = genai.Client(api_key=keys[0])
-        return client.models.generate_content(model=model, contents=contents, config=config)
+        return _gemini_generate_one_key(keys[0], model, contents, config)
 
     tried = set()
     while len(tried) < len(keys):
@@ -619,8 +733,7 @@ def _gemini_generate_with_rotation(keys, model, contents, config):
             break
         tried.add(api_key)
         try:
-            client = genai.Client(api_key=api_key)
-            return client.models.generate_content(model=model, contents=contents, config=config)
+            return _gemini_generate_one_key(api_key, model, contents, config)
         except genai_errors.ClientError as e:
             is_rate_limited = getattr(e, "code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e)
             if is_rate_limited:
@@ -631,7 +744,7 @@ def _gemini_generate_with_rotation(keys, model, contents, config):
     frappe.throw(_("All configured Gemini API keys are currently rate-limited. Please try again shortly."))
 
 
-def _call_gemini(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None, enable_list_pagination=False):
+def _call_gemini(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None, enable_list_pagination=False, model=None):
     import base64
     import json
     from google.genai import types
@@ -640,7 +753,7 @@ def _call_gemini(message, system_prompt, history_list, call_mcp, image_data=None
     if not gemini_keys:
         frappe.throw(_("gemini_api_keys not configured in site_config.json"))
 
-    model = _ai_conf("gemini_model") or "gemini-flash-lite-latest"
+    model = model or _ai_conf("gemini_model") or "gemini-flash-lite-latest"
     is_extraction = bool(image_data)  # image present -> likely the invoice-extraction turn
     tools = _gemini_tools(include_preview=is_extraction)
 
@@ -676,16 +789,18 @@ def _call_gemini(message, system_prompt, history_list, call_mcp, image_data=None
     # on the final answer without a second Gemini call.
     last_list_call = None
 
-    for round_num in range(5):
+    for round_num in range(_max_tool_rounds()):
         gen_config_kwargs = {"tools": tools}
         if is_extraction:
             # Near-zero temperature for deterministic, repeatable field extraction --
             # the same invoice image should read the same numbers every time, not vary
             # run to run on values that get inserted straight into a Purchase Invoice.
             gen_config_kwargs["temperature"] = 0.1
+        _t_round = _time.perf_counter()
         response = _gemini_generate_with_rotation(
             gemini_keys, model, contents, types.GenerateContentConfig(**gen_config_kwargs)
         )
+        _log_ai_timing("gemini round", _t_round, round=round_num + 1, model=model)
 
         function_call = None
         for part in response.candidates[0].content.parts:
@@ -758,7 +873,9 @@ def _call_gemini(message, system_prompt, history_list, call_mcp, image_data=None
                 "validation_error": validation_error,
             })
 
+        _t_mcp = _time.perf_counter()
         mcp_data = call_mcp(tool_name, tool_args)
+        _log_ai_timing("mcp call", _t_mcp, tool=tool_name)
         if tool_name in ("list_documents", "get_document"):
             doctype = tool_args.get("doctype")
             last_single_doc_link = _extract_single_doc_link(doctype, mcp_data)
@@ -789,44 +906,212 @@ def _call_gemini(message, system_prompt, history_list, call_mcp, image_data=None
     return "Could not complete the request."
 
 
-def _call_claude(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None):
+def _new_answer_state():
+    return {"link": None, "names": {}, "list": None}
+
+
+def _track_tool_result(state, tool_name, tool_args, mcp_data):
+    """Record what the latest tool call returned so the final answer can get a
+    document link or a "Load More" payload (same rules as _call_gemini)."""
+    if tool_name in ("list_documents", "get_document"):
+        doctype = tool_args.get("doctype")
+        state["link"] = _extract_single_doc_link(doctype, mcp_data)
+        for name in _extract_doc_names(doctype, mcp_data):
+            state["names"][name] = doctype
+    else:
+        state["link"] = None
+
+    if tool_name == "list_documents" and (tool_args.get("limit") or 0) <= 50:
+        rows, _unused_count = _extract_list_rows(mcp_data)
+        requested_limit = tool_args.get("limit") or 0
+        state["list"] = {
+            "doctype": tool_args.get("doctype"),
+            "filters": tool_args.get("filters") or {},
+            "fields": tool_args.get("fields") or [],
+            "rows": rows,
+            "total": len(rows) if len(rows) < requested_limit else None,
+        } if rows else None
+    else:
+        state["list"] = None
+
+
+def _finalize_answer(state, result_text, enable_list_pagination):
     import json
-    import base64
+
+    last_list_call = state["list"]
+    if enable_list_pagination and last_list_call and len(last_list_call["rows"]) > 10:
+        summary_lines = [ln for ln in result_text.split("\n") if not ln.strip().startswith("|")]
+        return "LIST_DATA:" + json.dumps({
+            "doctype": last_list_call["doctype"],
+            "filters": last_list_call["filters"],
+            "fields": last_list_call["fields"],
+            "total": last_list_call["total"],
+            "rows": last_list_call["rows"][:10],
+            "summary": "\n".join(summary_lines).strip(),
+        })
+
+    doc_link = state["link"]
+    if not doc_link and state["names"]:
+        mentioned = [n for n in state["names"] if n in result_text]
+        if len(mentioned) == 1:
+            doc_link = {"doctype": state["names"][mentioned[0]], "name": mentioned[0]}
+    if doc_link:
+        doc_url = f"/app/{doc_link['doctype'].lower().replace(' ', '-')}/{doc_link['name']}"
+        result_text = f"{result_text}\n\n[Open {doc_link['name']} →]({doc_url})"
+    return result_text
+
+
+def _claude_key_list():
+    """Configured Claude keys as a list: enable_ai_assistant.claude_api_keys
+    (array, like gemini_api_keys), or the older single top-level claude_api_key."""
+    keys = _ai_conf("claude_api_keys")
+    if isinstance(keys, list):
+        keys = [k for k in keys if k]
+        if keys:
+            return keys
+    single = frappe.conf.get("claude_api_key")
+    return [single] if single else []
+
+
+def _claude_cooldown_cache_key(api_key):
+    # Last 8 chars only, so full secrets never end up in cache key names.
+    return f"claude_key_cooldown:{api_key[-8:]}"
+
+
+def _claude_pick_available_key(candidate_keys):
+    """First key not currently resting — checked fresh against Redis every call,
+    so it sees cooldowns set by any worker process. None if all are resting."""
+    for k in candidate_keys:
+        if not frappe.cache().get_value(_claude_cooldown_cache_key(k)):
+            return k
+    return None
+
+
+def _claude_rest_key(api_key, seconds):
+    frappe.cache().set_value(_claude_cooldown_cache_key(api_key), 1, expires_in_sec=seconds)
+
+
+def _claude_retry_after(error):
+    """Seconds Anthropic says to wait (retry-after header), else a minute."""
+    try:
+        return max(1, min(int(error.response.headers.get("retry-after")), 3600))
+    except Exception:
+        return _CLAUDE_MINUTE_COOLDOWN_SEC
+
+
+def _claude_send(client, messages, request_kwargs):
+    """One request. A model that rejects an explicit temperature is retried without it."""
     import anthropic
 
-    api_key = frappe.conf.get("claude_api_key")
-    if not api_key:
-        frappe.throw(_("claude_api_key not configured in site_config.json"))
+    try:
+        return client.messages.create(messages=messages, **request_kwargs)
+    except anthropic.BadRequestError as e:
+        if "temperature" in request_kwargs and "temperature" in str(e).lower():
+            request_kwargs.pop("temperature")
+            return client.messages.create(messages=messages, **request_kwargs)
+        raise
 
-    model = frappe.conf.get("claude_model") or "claude-haiku-4-5-20251001"
-    client = anthropic.Anthropic(api_key=api_key)
+
+def _claude_create(keys, messages, request_kwargs):
+    """Send the request with the first usable key. If a key is rate-limited it
+    rests for the time Anthropic asks for and the next key is tried; a key
+    Anthropic rejects as invalid is skipped for an hour. Any other error is
+    raised straight away, since another key wouldn't fix it."""
+    import anthropic
+
+    def attempt(api_key):
+        return _claude_send(anthropic.Anthropic(api_key=api_key), messages, request_kwargs)
+
+    busy_msg = _("The AI service is busy right now (rate limit reached). Please try again in a moment.")
+    invalid_msg = _("The Claude API key is invalid or expired. Please contact admin.")
+
+    # One key: no pool to switch within, so skip the cooldown bookkeeping.
+    if len(keys) == 1:
+        try:
+            return attempt(keys[0])
+        except anthropic.RateLimitError:
+            frappe.throw(busy_msg)
+        except anthropic.AuthenticationError:
+            frappe.throw(invalid_msg)
+
+    tried = set()
+    rate_limited = False
+    while len(tried) < len(keys):
+        api_key = _claude_pick_available_key([k for k in keys if k not in tried])
+        if not api_key:
+            break
+        tried.add(api_key)
+        try:
+            return attempt(api_key)
+        except anthropic.RateLimitError as e:
+            rate_limited = True
+            _claude_rest_key(api_key, _claude_retry_after(e))
+        except anthropic.AuthenticationError:
+            frappe.log_error(f"Claude API key ending ...{api_key[-4:]} was rejected as invalid.", "Claude API key rejected")
+            _claude_rest_key(api_key, _CLAUDE_BAD_KEY_COOLDOWN_SEC)
+
+    frappe.throw(busy_msg if rate_limited else _("All configured Claude API keys are currently unavailable. Please try again shortly."))
+
+
+def _call_claude(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None, enable_list_pagination=False, model=None):
+    import json
+
+    claude_keys = _claude_key_list()
+    if not claude_keys:
+        frappe.throw(_("claude_api_keys not configured in site_config.json"))
+
+    model = model or "claude-haiku-4-5-20251001"
+    is_extraction = bool(image_data)
 
     messages = []
     for h in history_list:
+        # Claude rejects empty text blocks, and wants the conversation to open
+        # with a user turn (the widget sends only the last 6 messages).
+        if not h.get("content"):
+            continue
         role = "assistant" if h.get("role") == "model" else h.get("role", "user")
-        messages.append({"role": role, "content": h.get("content", "")})
+        if not messages and role == "assistant":
+            continue
+        messages.append({"role": role, "content": h["content"]})
 
-    # Current user message (Claude supports JPEG/PNG/GIF/WEBP only — no PDF)
     _CLAUDE_IMG_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
     user_content = []
-    if image_data and image_mime and image_mime in _CLAUDE_IMG_TYPES:
+    if image_data and image_mime in _CLAUDE_IMG_TYPES:
         user_content.append({"type": "image", "source": {"type": "base64", "media_type": image_mime, "data": image_data}})
+    elif image_data and image_mime == "application/pdf":
+        user_content.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": image_data}})
     user_content.append({"type": "text", "text": message})
     messages.append({"role": "user", "content": user_content})
 
-    for _ in range(5):
-        response = client.messages.create(
-            model=model,
-            max_tokens=4096,
-            system=system_prompt,
-            tools=_claude_tools(),
-            messages=messages
-        )
+    tools = _claude_tools(include_preview=is_extraction)
+    # The tool definitions are long and identical on every request and every
+    # tool-calling round — cache them so repeat calls are faster and cheaper.
+    tools[-1]["cache_control"] = {"type": "ephemeral"}
+
+    request_kwargs = {
+        "model": model,
+        "max_tokens": 8192 if is_extraction else 4096,
+        "system": system_prompt,
+        "tools": tools,
+    }
+    if is_extraction:
+        # Low temperature so the same invoice reads the same numbers every time.
+        request_kwargs["temperature"] = 0.1
+
+    state = _new_answer_state()
+
+    for _round in range(_max_tool_rounds()):
+        response = _claude_create(claude_keys, messages, request_kwargs)
+
+        if response.stop_reason == "max_tokens":
+            # A reply cut off mid-way would be an empty answer, or a half-written
+            # invoice preview — say so instead of showing nothing.
+            return _("The response was too long and got cut off. Please try again, or ask for fewer items at a time.")
 
         if response.stop_reason != "tool_use":
             for block in response.content:
                 if hasattr(block, "text"):
-                    return block.text
+                    return _finalize_answer(state, block.text, enable_list_pagination)
             return ""
 
         # Handle ALL tool_use blocks — Claude requires a tool_result for every one
@@ -834,7 +1119,6 @@ def _call_claude(message, system_prompt, history_list, call_mcp, image_data=None
         if not tool_use_blocks:
             break
 
-        # Check for preview_purchase_invoice first
         for tb in tool_use_blocks:
             if tb.name == "preview_purchase_invoice":
                 mapped, validation_error = _validate_mapped_data(tb.input.get("mapped_data", "{}"))
@@ -843,12 +1127,22 @@ def _call_claude(message, system_prompt, history_list, call_mcp, image_data=None
                     "summary": tb.input.get("summary", ""),
                     "validation_error": validation_error,
                 })
+            if tb.name == "preview_quotation":
+                mapped, validation_error = _validate_quotation_data(tb.input.get("mapped_data", "{}"))
+                return "QUOTATION_PREVIEW:" + json.dumps({
+                    "mapped_data": mapped,
+                    "summary": tb.input.get("summary", ""),
+                    "validation_error": validation_error,
+                })
 
-        # Call MCP for all tool_use blocks and collect results
         tool_results = []
         for tb in tool_use_blocks:
             mcp_result = call_mcp(tb.name, tb.input)
-            tool_results.append({"type": "tool_result", "tool_use_id": tb.id, "content": mcp_result})
+            _track_tool_result(state, tb.name, tb.input, mcp_result)
+            tool_result = {"type": "tool_result", "tool_use_id": tb.id, "content": mcp_result}
+            if isinstance(mcp_result, str) and mcp_result.startswith("Error:"):
+                tool_result["is_error"] = True
+            tool_results.append(tool_result)
 
         messages.append({"role": "assistant", "content": response.content})
         messages.append({"role": "user", "content": tool_results})
@@ -856,7 +1150,7 @@ def _call_claude(message, system_prompt, history_list, call_mcp, image_data=None
     return "Could not complete the request."
 
 
-def _call_openai_compatible(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None, provider="openrouter"):
+def _call_openai_compatible(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None, provider="openrouter", model=None):
     import json
     import requests
 
@@ -872,7 +1166,7 @@ def _call_openai_compatible(message, system_prompt, history_list, call_mcp, imag
     if not api_key:
         frappe.throw(_(f"{key_field} not configured in site_config.json"))
 
-    model = frappe.conf.get(model_field) or default_model
+    model = model or frappe.conf.get(model_field) or default_model
 
     messages = [{"role": "system", "content": system_prompt}]
     for h in history_list:
@@ -890,7 +1184,7 @@ def _call_openai_compatible(message, system_prompt, history_list, call_mcp, imag
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    for _ in range(5):
+    for _ in range(_max_tool_rounds()):
         resp = requests.post(base_url, headers=headers,
                              json={"model": model, "messages": messages, "tools": _oai_tools()},
                              timeout=60)
@@ -939,7 +1233,7 @@ def _call_openai_compatible(message, system_prompt, history_list, call_mcp, imag
     return "Could not complete the request."
 
 
-def _call_bedrock(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None):
+def _call_bedrock(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None, model=None):
     import json
     import base64
     import boto3
@@ -950,7 +1244,7 @@ def _call_bedrock(message, system_prompt, history_list, call_mcp, image_data=Non
         frappe.throw(_("bedrock_access_key and bedrock_secret_key not configured in site_config.json"))
 
     region = frappe.conf.get("bedrock_region") or "us-east-1"
-    model  = frappe.conf.get("bedrock_model")  or "anthropic.claude-3-haiku-20240307-v1:0"
+    model  = model or frappe.conf.get("bedrock_model")  or "anthropic.claude-3-haiku-20240307-v1:0"
 
     client = boto3.client("bedrock-runtime",
                           aws_access_key_id=access_key,
@@ -970,7 +1264,7 @@ def _call_bedrock(message, system_prompt, history_list, call_mcp, image_data=Non
     user_content.append({"text": message})
     messages.append({"role": "user", "content": user_content})
 
-    for _ in range(5):
+    for _ in range(_max_tool_rounds()):
         resp = client.converse(
             modelId=model,
             messages=messages,
@@ -1015,17 +1309,18 @@ def _call_bedrock(message, system_prompt, history_list, call_mcp, image_data=Non
 
 def _ai_single_completion(prompt):
     """Single-shot, tool-free completion: send one prompt, get raw text back.
-    Routes to whichever ai_provider is configured in site_config.json —
+    Routes to whichever ai_provider_chat is configured in site_config.json —
     same provider selection ask_document/chat_api already use — so a plain
     mapping/extraction call isn't hard-coupled to one vendor's SDK the way
     _call_gemini's full tool-calling loop is."""
-    ai_provider = _ai_conf("ai_provider") or "gemini"
+    ai_provider = _pick_ai_provider()
+    model_override = _pick_ai_model()
 
     if ai_provider == "gemini":
         gemini_keys = _gemini_key_list()
         if not gemini_keys:
             frappe.throw(_("gemini_api_keys not configured in site_config.json"))
-        model = _ai_conf("gemini_model") or "gemini-flash-lite-latest"
+        model = model_override or _ai_conf("gemini_model") or "gemini-flash-lite-latest"
         from google.genai import types
         contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
         response = _gemini_generate_with_rotation(
@@ -1034,14 +1329,15 @@ def _ai_single_completion(prompt):
         return response.text or ""
 
     if ai_provider == "claude":
-        import anthropic
-        api_key = frappe.conf.get("claude_api_key")
-        if not api_key:
-            frappe.throw(_("claude_api_key not configured in site_config.json"))
-        model = frappe.conf.get("claude_model") or "claude-haiku-4-5-20251001"
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=model, max_tokens=4096, messages=[{"role": "user", "content": prompt}]
+        claude_keys = _claude_key_list()
+        if not claude_keys:
+            frappe.throw(_("claude_api_keys not configured in site_config.json"))
+        model = model_override or "claude-haiku-4-5-20251001"
+        # Same low temperature the Gemini branch uses, so mapping is repeatable.
+        response = _claude_create(
+            claude_keys,
+            [{"role": "user", "content": prompt}],
+            {"model": model, "max_tokens": 4096, "temperature": 0.1},
         )
         for block in response.content:
             if hasattr(block, "text"):
@@ -1060,7 +1356,7 @@ def _ai_single_completion(prompt):
         api_key = frappe.conf.get(key_field)
         if not api_key:
             frappe.throw(_(f"{key_field} not configured in site_config.json"))
-        model = frappe.conf.get(model_field) or default_model
+        model = model_override or frappe.conf.get(model_field) or default_model
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         resp = requests.post(
             base_url, headers=headers,
@@ -1078,7 +1374,7 @@ def _ai_single_completion(prompt):
         if not access_key or not secret_key:
             frappe.throw(_("bedrock_access_key and bedrock_secret_key not configured in site_config.json"))
         region = frappe.conf.get("bedrock_region") or "us-east-1"
-        model  = frappe.conf.get("bedrock_model")  or "anthropic.claude-3-haiku-20240307-v1:0"
+        model  = model_override or frappe.conf.get("bedrock_model")  or "anthropic.claude-3-haiku-20240307-v1:0"
         client = boto3.client("bedrock-runtime",
                               aws_access_key_id=access_key,
                               aws_secret_access_key=secret_key,
@@ -1101,7 +1397,8 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
     from datetime import date
     from frappe.utils.password import get_decrypted_password
 
-    ai_provider = _ai_conf("ai_provider") or "gemini"
+    _t_request = _time.perf_counter()
+    ai_provider = _pick_ai_provider(has_image=bool(image_data))
 
     current_user   = frappe.session.user
 
@@ -1212,6 +1509,8 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
     # If uploaded file is a JPEG/PNG, convert to OCR PDF before sending to AI.
     # ocrmypdf deskews phone photos and adds a text layer → more accurate extraction.
     _IMAGE_MIMES = {"image/jpeg", "image/jpg", "image/png"}
+    _t_convert = _time.perf_counter()
+    _converting = bool(image_data and image_mime and image_mime in _IMAGE_MIMES)
     if image_data and image_mime and image_mime in _IMAGE_MIMES:
         import base64 as _b64
         import io as _io
@@ -1241,20 +1540,27 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
         except Exception:
             print("AI image→PDF: conversion failed, sending original image to AI")
 
+    if _converting:
+        _log_ai_timing("image to PDF (img2pdf + OCR)", _t_convert)
+
     # Route to provider
     kwargs = dict(message=message, system_prompt=system_prompt, history_list=history_list,
-                  call_mcp=call_mcp, image_data=image_data, image_mime=image_mime)
+                  call_mcp=call_mcp, image_data=image_data, image_mime=image_mime,
+                  model=_pick_ai_model(has_image=bool(image_data)))
 
-    if ai_provider == "gemini":
-        return _call_gemini(**kwargs, enable_list_pagination=True)
-    elif ai_provider == "claude":
-        return _call_claude(**kwargs)
-    elif ai_provider in ("openrouter", "kimi", "glm", "deepseek"):
-        return _call_openai_compatible(**kwargs, provider=ai_provider)
-    elif ai_provider == "bedrock":
-        return _call_bedrock(**kwargs)
-    else:
-        frappe.throw(_(f"Unknown ai_provider '{ai_provider}'. Valid: gemini, claude, openrouter, bedrock, kimi, glm, deepseek"))
+    try:
+        if ai_provider == "gemini":
+            return _call_gemini(**kwargs, enable_list_pagination=True)
+        elif ai_provider == "claude":
+            return _call_claude(**kwargs, enable_list_pagination=True)
+        elif ai_provider in ("openrouter", "kimi", "glm", "deepseek"):
+            return _call_openai_compatible(**kwargs, provider=ai_provider)
+        elif ai_provider == "bedrock":
+            return _call_bedrock(**kwargs)
+        else:
+            frappe.throw(_(f"Unknown ai_provider '{ai_provider}'. Valid: gemini, claude, openrouter, bedrock, kimi, glm, deepseek"))
+    finally:
+        _log_ai_timing("ask_document total", _t_request, provider=ai_provider, image=bool(image_data))
 
 
 # ─── "Load More" pagination for LIST_DATA responses ───────────────────────────
@@ -1348,7 +1654,7 @@ def chat_api(message, conversation_history=None):
     if not message:
         frappe.throw(_("message is required"))
 
-    ai_provider = _ai_conf("ai_provider") or "gemini"
+    ai_provider = _pick_ai_provider()
 
     current_user   = frappe.session.user
 
@@ -1442,7 +1748,8 @@ def chat_api(message, conversation_history=None):
 
     try:
         kwargs = dict(message=message, system_prompt=system_prompt, history_list=history_list,
-                      call_mcp=call_mcp, image_data=None, image_mime=None)
+                      call_mcp=call_mcp, image_data=None, image_mime=None,
+                      model=_pick_ai_model())
 
         if ai_provider == "gemini":
             result = _call_gemini(**kwargs)
@@ -1595,6 +1902,127 @@ def extract_fields_from_message(**kwargs):
     }
 
 
+# ─── Item mapping for the Purchase Invoice preview ───────────────────────────
+
+def _name_similarity(a, b):
+    from difflib import SequenceMatcher
+
+    a, b = (a or "").lower().strip(), (b or "").lower().strip()
+    r1 = SequenceMatcher(None, a, b).ratio()
+    r2 = SequenceMatcher(None, " ".join(sorted(a.split())), " ".join(sorted(b.split()))).ratio()
+    return max(r1, r2)
+
+
+def _rows_from_mcp_list(result_text):
+    """Row list out of a list_documents MCP reply, whichever wrapper it came in."""
+    import json
+
+    try:
+        parsed = json.loads(result_text or "[]")
+    except Exception:
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    if not isinstance(parsed, dict):
+        return []
+    inner = parsed.get("result", parsed)
+    if isinstance(inner, list):
+        return inner
+    rows = inner.get("data", inner.get("message", [])) if isinstance(inner, dict) else []
+    if not rows:
+        rows = parsed.get("data", parsed.get("message", []))
+    return rows if isinstance(rows, list) else []
+
+
+@frappe.whitelist()
+def match_items(names):
+    """How each extracted item name relates to the Item master, so the preview can
+    map it BEFORE the invoice is created.
+
+    Per name returns {"status", "candidates"} where candidates are up to 5 items at
+    least 70% similar, best first, as {"code", "label", "score"} (score in percent):
+      "exact"   95% or more   treated as found, nothing to choose
+      "pick"    80% to <95%   dropdown, best match preselected
+      "suggest" 70% to <80%   dropdown, nothing preselected
+      "none"    below 70%     not in the system (Create warns, as before)"""
+    import json
+    import requests
+    from frappe.utils.password import get_decrypted_password
+
+    if not frappe.has_permission("Purchase Invoice", "create"):
+        frappe.throw(_("You don't have permission to create a Purchase Invoice."), frappe.PermissionError)
+
+    if isinstance(names, str):
+        names = json.loads(names)
+    names = [str(n or "") for n in (names or [])][:100]
+
+    current_user    = frappe.session.user
+    _mcp_api_key    = frappe.db.get_value("User", current_user, "api_key")
+    _mcp_api_secret = None
+    if _mcp_api_key:
+        try:
+            _mcp_api_secret = get_decrypted_password("User", current_user, "api_secret")
+        except Exception:
+            _mcp_api_secret = None
+
+    def _call_mcp(tool_name, tool_args):
+        fac_api_key    = _mcp_api_key
+        fac_api_secret = _mcp_api_secret
+        try:
+            resp = requests.post(
+                _mcp_url(),
+                headers={"Authorization": f"token {fac_api_key}:{fac_api_secret}", "Content-Type": "application/json"},
+                json={"jsonrpc": "2.0", "method": "tools/call", "params": {"name": tool_name, "arguments": tool_args}, "id": 1},
+                timeout=30
+            )
+            if resp.status_code == 200:
+                content = resp.json().get("result", {}).get("content", [])
+                if content and isinstance(content, list):
+                    return content[0].get("text", "")
+        except Exception:
+            pass
+        return ""
+
+    item_master = _rows_from_mcp_list(_call_mcp("list_documents", {
+        "doctype": "Item",
+        "filters": {"disabled": 0},
+        "fields": ["name", "item_name", "stock_uom"],
+        "limit": 1000
+    }))
+
+    out = []
+    for raw in names:
+        raw = raw.strip()
+        scored = []
+        # a purely numeric "name" is a row/serial number picked up from the table, not a product
+        if raw and not raw.isdigit():
+            for candidate in item_master:
+                label = candidate.get("item_name") or candidate.get("name") or ""
+                score = _name_similarity(raw, label)
+                if score >= _ITEM_SUGGEST_THRESHOLD:
+                    scored.append((score, candidate))
+        scored.sort(key=lambda pair: -pair[0])
+
+        top = scored[0][0] if scored else 0.0
+        if top >= _ITEM_AUTO_THRESHOLD:
+            status = "exact"
+        elif top >= _FUZZY_MATCH_THRESHOLD:
+            status = "pick"
+        elif top >= _ITEM_SUGGEST_THRESHOLD:
+            status = "suggest"
+        else:
+            status = "none"
+
+        out.append({
+            "status": status,
+            "candidates": [
+                {"code": c.get("name"), "label": c.get("item_name") or c.get("name"), "score": int(s * 100 + 1e-9)}
+                for s, c in scored[:5]
+            ],
+        })
+    return out
+
+
 # ─── Purchase Invoice creation ────────────────────────────────────────────────
 
 @frappe.whitelist()
@@ -1713,13 +2141,26 @@ def create_purchase_invoice_from_data(data):
                 if item_name_raw.isdigit():
                     continue
 
+                # Mapped in the preview (match_items): the user picked this exact Item.
                 best, best_score = None, 0.0
-                for candidate in item_master:
-                    cname = candidate.get("item_name") or candidate.get("name") or ""
-                    score = _similarity(item_name_raw, cname)
-                    if score > best_score:
-                        best_score = score
-                        best = candidate
+                chosen_code = str(item.get("matched_item_code") or "").strip()
+                if chosen_code:
+                    best = next((c for c in item_master if c.get("name") == chosen_code), None)
+                    if not best:
+                        # Not among the 1000 rows fetched above, but a real active Item.
+                        best = frappe.db.get_value(
+                            "Item", {"name": chosen_code, "disabled": 0}, ["name", "item_name", "stock_uom"], as_dict=True
+                        )
+                    if best:
+                        best_score = 1.0
+
+                if not best:
+                    for candidate in item_master:
+                        cname = candidate.get("item_name") or candidate.get("name") or ""
+                        score = _similarity(item_name_raw, cname)
+                        if score > best_score:
+                            best_score = score
+                            best = candidate
 
                 if best and best_score >= _FUZZY_MATCH_THRESHOLD:
                     qty = float(item.get("qty", 1)) or 1.0
@@ -1745,7 +2186,7 @@ def create_purchase_invoice_from_data(data):
                         "rate":        rate,
                         "uom":         item.get("uom") or best.get("stock_uom") or "Nos",
                     }
-                    skip_item_fields = {"item_code", "item_name", "description", "qty", "rate", "uom", "discount_amount"}
+                    skip_item_fields = {"item_code", "item_name", "description", "qty", "rate", "uom", "discount_amount", "matched_item_code"}
                     for k, v in item.items():
                         if k not in skip_item_fields and v and not isinstance(v, (list, dict)):
                             item_row[k] = v
