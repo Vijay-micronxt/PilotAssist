@@ -10,7 +10,7 @@ required_apps = ["erpnext"]
 boot_session = "pilot_assist.api.ai_api.boot_session"
 
 app_include_js = [
-    "/assets/pilot_assist/js/pilot_assist_widget.js?v=1",
+    "/assets/pilot_assist/js/pilot_assist_widget.js?v=4",
 ]
 
 after_install = "pilot_assist.install.after_install"
