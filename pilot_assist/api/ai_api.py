@@ -32,6 +32,7 @@ def _ai_conf(key, default=None):
             "max_tool_rounds": 6,
             "gemini_api_keys": ["...", "..."],
             "claude_api_keys": ["...", "..."],
+            "deepseek_api_keys": ["...", "..."],
             "sarvam_api_key": "...",
             "enable_speech_to_text": 1,
             "enable_role_based_ai": 1,
@@ -1150,21 +1151,113 @@ def _call_claude(message, system_prompt, history_list, call_mcp, image_data=None
     return "Could not complete the request."
 
 
-def _call_openai_compatible(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None, provider="openrouter", model=None):
-    import json
+# OpenAI-compatible providers: provider -> (single-key field, model field, default model, url)
+_OPENAI_COMPATIBLE = {
+    "openrouter": ("openrouter_api_key", "openrouter_model", "nvidia/nemotron-3-nano-30b-a3b:free", "https://openrouter.ai/api/v1/chat/completions"),
+    "kimi":       ("kimi_api_key",       "kimi_model",       "moonshot-v1-8k",                      "https://api.moonshot.cn/v1/chat/completions"),
+    "glm":        ("glm_api_key",        "glm_model",        "glm-4",                               "https://open.bigmodel.cn/api/paas/v4/chat/completions"),
+    "deepseek":   ("deepseek_api_key",   "deepseek_model",   "deepseek-chat",                       "https://api.deepseek.com/chat/completions"),
+}
+_OAI_MINUTE_COOLDOWN_SEC = 60
+_OAI_BAD_KEY_COOLDOWN_SEC = 60 * 60
+
+# Options sent with every request to a provider unless site_config changes them. DeepSeek runs
+# with thinking ON and reasoning effort HIGH: it counts and ranks over fetched data more reliably,
+# at the cost of some extra time and tokens. Either can be changed per site with
+# deepseek_extra_params, e.g. {"thinking": {"type": "disabled"}} or {"reasoning_effort": "medium"}.
+_OAI_DEFAULT_PARAMS = {
+    "deepseek": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
+}
+
+
+def _oai_key_list(provider):
+    """Keys for an OpenAI-compatible provider: enable_ai_assistant.<provider>_api_keys
+    (array, like gemini_api_keys and claude_api_keys), or the older single top-level
+    <provider>_api_key."""
+    keys = _ai_conf(f"{provider}_api_keys")
+    if isinstance(keys, list):
+        keys = [k for k in keys if k]
+        if keys:
+            return keys
+    single = frappe.conf.get(_OPENAI_COMPATIBLE[provider][0])
+    return [single] if single else []
+
+
+def _oai_cooldown_cache_key(provider, api_key):
+    # Last 8 chars only, so full secrets never end up in cache key names.
+    return f"{provider}_key_cooldown:{api_key[-8:]}"
+
+
+def _oai_retry_after(resp):
+    """Seconds the provider asks us to wait (Retry-After header), else a minute."""
+    try:
+        return max(1, min(int(resp.headers.get("retry-after")), 3600))
+    except Exception:
+        return _OAI_MINUTE_COOLDOWN_SEC
+
+
+def _oai_post(provider, keys, payload):
+    """POST one chat-completions request with the first usable key. 429: the key rests
+    for the time the provider asks (or a minute) and the next key is tried. 401/402/403:
+    the key is invalid, expired or out of balance and is skipped for an hour. Any other
+    status goes back to the caller untouched, since another key wouldn't fix it."""
     import requests
 
-    provider_config = {
-        "openrouter": ("openrouter_api_key", "openrouter_model", "nvidia/nemotron-3-nano-30b-a3b:free", "https://openrouter.ai/api/v1/chat/completions"),
-        "kimi":       ("kimi_api_key",       "kimi_model",       "moonshot-v1-8k",                      "https://api.moonshot.cn/v1/chat/completions"),
-        "glm":        ("glm_api_key",        "glm_model",        "glm-4",                               "https://open.bigmodel.cn/api/paas/v4/chat/completions"),
-        "deepseek":   ("deepseek_api_key",   "deepseek_model",   "deepseek-chat",                       "https://api.deepseek.com/chat/completions"),
-    }
-    key_field, model_field, default_model, base_url = provider_config[provider]
+    base_url = _OPENAI_COMPATIBLE[provider][3]
 
-    api_key = frappe.conf.get(key_field)
-    if not api_key:
-        frappe.throw(_(f"{key_field} not configured in site_config.json"))
+    # Options sent with EVERY request to this provider: the built-in defaults (_OAI_DEFAULT_PARAMS),
+    # overridden by enable_ai_assistant.<provider>_extra_params. The request's own
+    # model/messages/tools always win over both.
+    configured = _ai_conf(f"{provider}_extra_params")
+    extra = {**_OAI_DEFAULT_PARAMS.get(provider, {}), **(configured if isinstance(configured, dict) else {})}
+    if extra:
+        payload = {**extra, **payload}
+
+    busy_msg = _("The AI service is busy right now (rate limit reached). Please try again in a moment.")
+    unusable_msg = _("The AI provider API key is invalid, expired or out of balance. Please contact admin.")
+
+    tried = set()
+    rate_limited = False
+    while len(tried) < len(keys):
+        remaining = [k for k in keys if k not in tried]
+        # One key: no pool to switch within, so skip the cooldown bookkeeping.
+        if len(keys) == 1:
+            api_key = remaining[0]
+        else:
+            api_key = next((k for k in remaining if not frappe.cache().get_value(_oai_cooldown_cache_key(provider, k))), None)
+        if not api_key:
+            break
+        tried.add(api_key)
+
+        resp = requests.post(
+            base_url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json=payload, timeout=60,
+        )
+        if resp.status_code == 429:
+            if len(keys) == 1:
+                frappe.throw(busy_msg)
+            rate_limited = True
+            frappe.cache().set_value(_oai_cooldown_cache_key(provider, api_key), 1, expires_in_sec=_oai_retry_after(resp))
+            continue
+        if resp.status_code in (401, 402, 403):
+            if len(keys) == 1:
+                frappe.throw(unusable_msg)
+            frappe.log_error(f"{provider} API key ending ...{api_key[-4:]} was rejected (HTTP {resp.status_code}).", "AI API key rejected")
+            frappe.cache().set_value(_oai_cooldown_cache_key(provider, api_key), 1, expires_in_sec=_OAI_BAD_KEY_COOLDOWN_SEC)
+            continue
+        return resp
+
+    frappe.throw(busy_msg if rate_limited else _("All configured AI API keys are currently unavailable. Please try again shortly."))
+
+
+def _call_openai_compatible(message, system_prompt, history_list, call_mcp, image_data=None, image_mime=None, enable_list_pagination=False, provider="openrouter", model=None):
+    import json
+
+    _key_field, model_field, default_model, _url = _OPENAI_COMPATIBLE[provider]
+    keys = _oai_key_list(provider)
+    if not keys:
+        frappe.throw(_(f"{provider}_api_keys not configured in site_config.json"))
 
     model = model or frappe.conf.get(model_field) or default_model
 
@@ -1182,12 +1275,10 @@ def _call_openai_compatible(message, system_prompt, history_list, call_mcp, imag
     else:
         messages.append({"role": "user", "content": message})
 
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    state = _new_answer_state()
 
-    for _ in range(_max_tool_rounds()):
-        resp = requests.post(base_url, headers=headers,
-                             json={"model": model, "messages": messages, "tools": _oai_tools()},
-                             timeout=60)
+    for _round in range(_max_tool_rounds()):
+        resp = _oai_post(provider, keys, {"model": model, "messages": messages, "tools": _oai_tools()})
         if resp.status_code != 200:
             return f"API error: {resp.text}"
 
@@ -1196,7 +1287,7 @@ def _call_openai_compatible(message, system_prompt, history_list, call_mcp, imag
 
         if choice.get("finish_reason") != "tool_calls":
             result = choice["message"].get("content", "") or ""
-            return result
+            return _finalize_answer(state, result, enable_list_pagination)
 
         tool_calls = choice["message"].get("tool_calls", [])
         if not tool_calls:
@@ -1226,6 +1317,7 @@ def _call_openai_compatible(message, system_prompt, history_list, call_mcp, imag
             except Exception:
                 tool_args = {}
             mcp_result = call_mcp(tc["function"]["name"], tool_args)
+            _track_tool_result(state, tc["function"]["name"], tool_args, mcp_result)
             tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": mcp_result})
 
         messages.extend(tool_results)
@@ -1264,7 +1356,7 @@ def _call_bedrock(message, system_prompt, history_list, call_mcp, image_data=Non
     user_content.append({"text": message})
     messages.append({"role": "user", "content": user_content})
 
-    for _ in range(_max_tool_rounds()):
+    for _round in range(_max_tool_rounds()):
         resp = client.converse(
             modelId=model,
             messages=messages,
@@ -1344,25 +1436,13 @@ def _ai_single_completion(prompt):
                 return block.text
         return ""
 
-    if ai_provider in ("openrouter", "kimi", "glm", "deepseek"):
-        import requests
-        provider_config = {
-            "openrouter": ("openrouter_api_key", "openrouter_model", "nvidia/nemotron-3-nano-30b-a3b:free", "https://openrouter.ai/api/v1/chat/completions"),
-            "kimi":       ("kimi_api_key",       "kimi_model",       "moonshot-v1-8k",                      "https://api.moonshot.cn/v1/chat/completions"),
-            "glm":        ("glm_api_key",        "glm_model",        "glm-4",                               "https://open.bigmodel.cn/api/paas/v4/chat/completions"),
-            "deepseek":   ("deepseek_api_key",   "deepseek_model",   "deepseek-chat",                       "https://api.deepseek.com/chat/completions"),
-        }
-        key_field, model_field, default_model, base_url = provider_config[ai_provider]
-        api_key = frappe.conf.get(key_field)
-        if not api_key:
-            frappe.throw(_(f"{key_field} not configured in site_config.json"))
+    if ai_provider in _OPENAI_COMPATIBLE:
+        _key_field, model_field, default_model, _url = _OPENAI_COMPATIBLE[ai_provider]
+        keys = _oai_key_list(ai_provider)
+        if not keys:
+            frappe.throw(_(f"{ai_provider}_api_keys not configured in site_config.json"))
         model = model_override or frappe.conf.get(model_field) or default_model
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        resp = requests.post(
-            base_url, headers=headers,
-            json={"model": model, "messages": [{"role": "user", "content": prompt}]},
-            timeout=60
-        )
+        resp = _oai_post(ai_provider, keys, {"model": model, "messages": [{"role": "user", "content": prompt}]})
         if resp.status_code != 200:
             frappe.throw(_(f"AI provider error: {resp.text}"))
         return resp.json()["choices"][0]["message"].get("content", "") or ""
@@ -1554,7 +1634,7 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
         elif ai_provider == "claude":
             return _call_claude(**kwargs, enable_list_pagination=True)
         elif ai_provider in ("openrouter", "kimi", "glm", "deepseek"):
-            return _call_openai_compatible(**kwargs, provider=ai_provider)
+            return _call_openai_compatible(**kwargs, enable_list_pagination=True, provider=ai_provider)
         elif ai_provider == "bedrock":
             return _call_bedrock(**kwargs)
         else:
