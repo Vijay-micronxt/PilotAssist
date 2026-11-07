@@ -1,0 +1,68 @@
+{
+  "_about": "REFERENCE ONLY. Every site_config.json setting this app reads, with dummy values. Copy the keys you need into sites/<site>/site_config.json and put the real values there. Never put real keys or tokens in this file. When you add, rename or remove a setting in the code, update this file in the same commit. Keys starting with _ are notes and are ignored by the app.",
+
+  "enable_ai_assistant": {
+    "enable_ai_chat": 1,
+
+    "_comment_providers": "ai_provider_chat answers chat questions. ai_provider_image reads uploaded images and PDFs (it falls back to the chat provider when missing). Providers: gemini, claude, deepseek, openrouter, kimi, glm, bedrock. The *_model keys name the model; leave them out to use the provider's own default.",
+    "ai_provider_chat": "deepseek",
+    "ai_provider_chat_model": "deepseek-chat",
+    "ai_provider_image": "deepseek",
+    "ai_provider_image_model": "deepseek-flash",
+
+    "_comment_keys": "Each provider takes a list of keys. With 2 or more keys a failing key is skipped for the next one: Gemini on any error, Claude and DeepSeek (also OpenRouter, Kimi, GLM) on rate-limit or rejected-key errors. Keys from different provider projects give separate quotas.",
+    "gemini_api_keys": ["REPLACE_WITH_GEMINI_KEY_1", "REPLACE_WITH_GEMINI_KEY_2"],
+    "claude_api_keys": ["REPLACE_WITH_CLAUDE_KEY"],
+    "deepseek_api_keys": ["REPLACE_WITH_DEEPSEEK_KEY"],
+    "openrouter_api_keys": [],
+    "kimi_api_keys": [],
+    "glm_api_keys": [],
+
+    "_comment_optional_models": "Optional. gemini_model is used when no ai_provider_*_model names a Gemini model. gemini_timeout_sec is how long one Gemini call may take.",
+    "gemini_model": "gemini-flash-lite-latest",
+    "gemini_timeout_sec": 60,
+    "max_tool_rounds": 6,
+
+    "_comment_extra_params": "Optional. Extra options sent with every request to that provider, for example {\"reasoning_effort\": \"medium\"} to lower DeepSeek's thinking. Empty means the built-in defaults (thinking on, effort high).",
+    "deepseek_extra_params": {},
+
+    "_comment_pdf": "Optional. Only needed to read PDFs with DeepSeek: path to the python of the separate Docling virtualenv, and a time limit in seconds (keep it at 90 or less, bench's web timeout is usually 120). Without it a PDF sent to DeepSeek shows a 'can read photos but not PDF files' message.",
+    "docling_python": "/home/frappe/docling-env/bin/python",
+    "docling_timeout_sec": 90,
+
+    "_comment_header_color": "Optional. Chat header color as a hex code (6 or 3 digits, the # may be left out). Missing or invalid means the default blue shown here.",
+    "header_color": "#5b8def",
+
+    "_comment_mcp_base_url": "Leave empty to use this site's own URL (normal). Only set it when the MCP server (frappe_assistant_core) runs on another site, for example https://other-site.example.com",
+    "mcp_base_url": "",
+
+    "_comment_speech": "Optional voice input. The mic button shows only when enable_speech_to_text is 1 and a Sarvam key is set.",
+    "enable_speech_to_text": 0,
+    "sarvam_api_key": "REPLACE_WITH_SARVAM_KEY",
+
+    "_comment_roles": "Optional role based access. When enable_role_based_ai is 1, a user's chat uses the token of the role they have; each token is 'api_key:api_secret' of a user that has the access that role should get. Leave it 0 to use each user's own API key.",
+    "enable_role_based_ai": 0,
+    "role_based_ai_credentials": [
+      {"role": "Sales User", "token": "REPLACE_API_KEY:REPLACE_API_SECRET"},
+      {"role": "Purchase Manager", "token": "REPLACE_API_KEY:REPLACE_API_SECRET"}
+    ]
+  },
+
+  "_comment_bedrock": "Optional. Only when ai_provider_chat or ai_provider_image is bedrock (AWS).",
+  "bedrock_access_key": "REPLACE_WITH_AWS_ACCESS_KEY",
+  "bedrock_secret_key": "REPLACE_WITH_AWS_SECRET_KEY",
+  "bedrock_region": "us-east-1",
+  "bedrock_model": "anthropic.claude-3-haiku-20240307-v1:0",
+
+  "_comment_sitemap": "Optional. How long the generated sitemap is cached, in seconds (default 300).",
+  "sitemap_cache_ttl": 300,
+
+  "_comment_whatsapp": "Optional fallback only. The WhatsApp auth token is normally read from WhatsApp Settings in the UI; this key is used when that is empty.",
+  "meta_w91_official": "REPLACE_WITH_WHATSAPP_AUTH_TOKEN",
+
+  "_comment_credit_limit": "Optional. People who must not get the credit limit email even if they are credit controllers.",
+  "credit_limit_email_exclude": ["someone@example.com"],
+
+  "_comment_host": "Standard Frappe setting, also used by the OTP feature to build links.",
+  "host_name": "https://erp.example.com"
+}
