@@ -1,3 +1,4 @@
+import re as _re
 import time as _time
 
 import frappe
@@ -6,10 +7,10 @@ from frappe import _
 
 _FUZZY_MATCH_THRESHOLD = 0.80
 
-# Item mapping on the Purchase Invoice preview (see match_items): at or above AUTO the
-# item counts as found; from SUGGEST up to AUTO the preview shows a dropdown of similar
-# items to map to; below SUGGEST the item is "not in the system".
-_ITEM_AUTO_THRESHOLD = 0.95
+# Item mapping on the Purchase Invoice preview (see match_items): only a full (100%) match
+# counts as found; from SUGGEST up to 99% the preview shows a dropdown of the matching items
+# to choose from; below SUGGEST the item is "not in the system".
+_ITEM_AUTO_THRESHOLD = 1.0
 _ITEM_SUGGEST_THRESHOLD = 0.70
 
 
@@ -34,6 +35,7 @@ def _ai_conf(key, default=None):
             "claude_api_keys": ["...", "..."],
             "deepseek_api_keys": ["...", "..."],
             "sarvam_api_key": "...",
+            "header_color": "#5b8def",
             "enable_speech_to_text": 1,
             "enable_role_based_ai": 1,
             "role_based_ai_credentials": [...]
@@ -41,6 +43,23 @@ def _ai_conf(key, default=None):
     All AI-related site config now lives under this one object instead of
     as flat top-level keys, so every reader goes through here."""
     return (frappe.conf.get("enable_ai_assistant") or {}).get(key, default)
+
+
+_DEFAULT_HEADER_COLOR = "#5b8def"
+
+
+def _ai_header_color():
+    """Chat header color: enable_ai_assistant.header_color, a hex code such as "#16a34a"
+    (the "#" may be left out, 3 or 6 digits). Anything else, or nothing, gives the
+    default blue, so a typo can never break the header or put stray CSS on the page."""
+    import re as _re
+
+    color = str(_ai_conf("header_color") or "").strip()
+    if _re.fullmatch(r"[0-9a-fA-F]{3}|[0-9a-fA-F]{6}", color):
+        color = "#" + color
+    if _re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})", color):
+        return color.lower()
+    return _DEFAULT_HEADER_COLOR
 
 
 def _pick_ai_provider(has_image=False):
@@ -136,6 +155,7 @@ def boot_session(bootinfo):
     bootinfo.enable_ai_chat = _ai_conf("enable_ai_chat", 0)
     bootinfo.enable_speech_to_text = _ai_conf("enable_speech_to_text", 0)
     bootinfo.ai_role_choices = _get_matched_role_choices(frappe.session.user)
+    bootinfo.ai_header_color = _ai_header_color()
 
 
 # ─── Role-based assistance mode ────────────────────────────────────────────────
@@ -667,6 +687,108 @@ def _log_ai_timing(label, started, **extra):
     _ai_logger().info(f"{label}: {_time.perf_counter() - started:.2f}s{details}")
 
 
+_DOCLING_DEFAULT_TIMEOUT_SEC = 180
+_DOCLING_MAX_CHARS = 60000
+
+
+def _docling_pdf_to_text(pdf_b64):
+    """PDF -> Markdown text (tables kept) with Docling, for providers that cannot
+    read a PDF. Docling runs in its OWN virtualenv (it pulls in PyTorch and newer
+    pydantic/numpy/pillow, which would clash with Frappe's pins): set
+    enable_ai_assistant.docling_python to that env's python. Returns None when it
+    is not configured, fails, times out or finds no text, so the caller can fall
+    back to its normal message."""
+    import base64
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    python_path = _ai_conf("docling_python")
+    if not python_path or not os.path.exists(python_path):
+        return None
+    try:
+        timeout = int(_ai_conf("docling_timeout_sec") or _DOCLING_DEFAULT_TIMEOUT_SEC)
+    except (TypeError, ValueError):
+        timeout = _DOCLING_DEFAULT_TIMEOUT_SEC
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "docling_convert.py")
+    started = _time.perf_counter()
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(base64.b64decode(pdf_b64))
+            tmp_path = f.name
+        proc = subprocess.run([python_path, script, tmp_path], capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _ai_logger().warning(f"Docling timed out after {timeout}s")
+        return None
+    except Exception as e:
+        _ai_logger().warning(f"Docling could not run: {type(e).__name__}: {e}")
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    if proc.returncode != 0:
+        _ai_logger().warning(f"Docling failed (exit {proc.returncode}): {proc.stderr.decode('utf-8', 'replace')[-300:]}")
+        return None
+    text = proc.stdout.decode("utf-8", "replace").strip()
+    _log_ai_timing("docling PDF to text", started, chars=len(text))
+    return text[:_DOCLING_MAX_CHARS] or None
+
+
+_PHOTO_MIMES = {"image/jpeg", "image/jpg", "image/png"}
+
+
+def _docling_configured():
+    """True when enable_ai_assistant.docling_python points at an existing python."""
+    import os
+
+    path = _ai_conf("docling_python")
+    return bool(path and os.path.exists(path))
+
+
+def _photo_to_pdf(image_b64, image_mime, ocr=True):
+    """JPEG/PNG photo -> PDF (img2pdf), then OCR (ocrmypdf: straightens a tilted photo and adds
+    a text layer) unless ocr=False. Returns the PDF as base64, or None when img2pdf is missing or
+    fails. When only the OCR step fails the plain PDF is returned. Gemini and Claude get the PDF
+    with OCR; DeepSeek passes ocr=False because Docling reads the picture itself."""
+    import base64
+    import io
+    import os
+    import tempfile
+
+    try:
+        import img2pdf
+
+        ext = ".png" if image_mime == "image/png" else ".jpg"
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+            f.write(base64.b64decode(image_b64))
+            path = f.name
+        try:
+            pdf_bytes = img2pdf.convert(path)
+        finally:
+            os.unlink(path)
+    except Exception:
+        return None
+
+    if ocr:
+        try:
+            import ocrmypdf
+
+            out = io.BytesIO()
+            ocrmypdf.ocr(io.BytesIO(pdf_bytes), out, deskew=True, force_ocr=True, progress_bar=False)
+            pdf_bytes = out.getvalue()
+        except Exception:
+            pass  # OCR not installed or failed: the plain PDF is still readable
+
+    return base64.b64encode(pdf_bytes).decode("utf-8")
+
+
 def _gemini_timeout_ms():
     try:
         sec = int(_ai_conf("gemini_timeout_sec") or _GEMINI_DEFAULT_TIMEOUT_SEC)
@@ -691,7 +813,13 @@ def _gemini_client(api_key):
     return client
 
 
-def _gemini_generate_one_key(api_key, model, contents, config):
+class _GeminiTransient(Exception):
+    """A Gemini failure with a user-facing message (overload, timeout). Plain
+    exception on purpose: frappe.throw() also queues the message for the
+    browser, which would show an error popup even when the next key succeeds."""
+
+
+def _gemini_call_raw(api_key, model, contents, config):
     """generate_content on one key. A 5xx from Google (the 503 "high demand"
     case) is retried once; a timeout becomes a clear message instead of a hang.
     4xx errors (including 429) are raised untouched for the rotation logic."""
@@ -704,11 +832,19 @@ def _gemini_generate_one_key(api_key, model, contents, config):
             if attempt == 1:
                 _ai_logger().warning("Gemini 5xx, retrying once")
                 continue
-            frappe.throw(_("The AI service is overloaded right now. Please try again in a moment."))
+            raise _GeminiTransient(_("The AI service is overloaded right now. Please try again in a moment."))
         except Exception as e:
             if type(e).__name__ in ("ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout", "TimeoutException"):
-                frappe.throw(_("The AI service took too long to respond. Please try again."))
+                raise _GeminiTransient(_("The AI service took too long to respond. Please try again."))
             raise
+
+
+def _gemini_generate_one_key(api_key, model, contents, config):
+    """Single-key call: a transient failure is shown to the user as a message."""
+    try:
+        return _gemini_call_raw(api_key, model, contents, config)
+    except _GeminiTransient as e:
+        frappe.throw(str(e))
 
 
 def _gemini_generate_with_rotation(keys, model, contents, config):
@@ -728,20 +864,32 @@ def _gemini_generate_with_rotation(keys, model, contents, config):
         return _gemini_generate_one_key(keys[0], model, contents, config)
 
     tried = set()
+    last_error = None
     while len(tried) < len(keys):
         api_key = _gemini_pick_available_key([k for k in keys if k not in tried])
         if not api_key:
             break
         tried.add(api_key)
         try:
-            return _gemini_generate_one_key(api_key, model, contents, config)
+            return _gemini_call_raw(api_key, model, contents, config)
         except genai_errors.ClientError as e:
             is_rate_limited = getattr(e, "code", None) == 429 or "RESOURCE_EXHAUSTED" in str(e)
             if is_rate_limited:
+                # Rested, so later requests skip this key until it recovers
                 _gemini_mark_rate_limited(api_key, e)
                 continue
-            raise
+            last_error = e
+        except Exception as e:
+            # Overload (503), timeout or anything else from this key: the next
+            # key is tried right away. No cooldown, the key itself isn't limited.
+            last_error = e
+        _ai_logger().warning(f"Gemini key ...{api_key[-4:]} failed ({type(last_error).__name__}), trying next key")
 
+    # Every key failed. Show the last real reason instead of a rate-limit message.
+    if isinstance(last_error, _GeminiTransient):
+        frappe.throw(str(last_error))
+    if last_error is not None:
+        raise last_error
     frappe.throw(_("All configured Gemini API keys are currently rate-limited. Please try again shortly."))
 
 
@@ -1478,7 +1626,8 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
     from frappe.utils.password import get_decrypted_password
 
     _t_request = _time.perf_counter()
-    ai_provider = _pick_ai_provider(has_image=bool(image_data))
+    has_file = bool(image_data)  # fixed here: the PDF path below may turn the file into text
+    ai_provider = _pick_ai_provider(has_image=has_file)
 
     current_user   = frappe.session.user
 
@@ -1586,38 +1735,44 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
         except Exception:
             pass
 
+    # DeepSeek, OpenRouter, Kimi and GLM take images only (image_url): a PDF is rejected
+    # with a 400. Gemini and Claude read PDFs, so only they get the conversion below.
+    _reads_pdf = ai_provider not in _OPENAI_COMPATIBLE
+    if image_data and image_mime == "application/pdf" and not _reads_pdf:
+        # DeepSeek only: Docling turns the PDF into text (see _docling_pdf_to_text) and
+        # that text is sent in place of the file. Without Docling set up, or if it
+        # fails, the user gets the message below as before.
+        pdf_text = _docling_pdf_to_text(image_data) if ai_provider == "deepseek" else None
+        if not pdf_text:
+            return _("{0} can read photos (JPG or PNG) but not PDF files. Please upload the invoice as an image, "
+                     "or set the image provider to Gemini or Claude.").format(ai_provider.title())
+        message = f"{message}\n\nThe uploaded PDF was converted to text (tables as Markdown):\n\n{pdf_text}"
+        image_data = image_mime = None
+
+    # DeepSeek photo: photo -> PDF -> Docling -> text -> DeepSeek (no separate OCR step, Docling
+    # reads the picture itself). Without Docling set up, or when any step fails, the photo goes
+    # to DeepSeek as it is, exactly as before.
+    if image_data and image_mime in _PHOTO_MIMES and ai_provider == "deepseek" and _docling_configured():
+        _t_photo = _time.perf_counter()
+        photo_pdf = _photo_to_pdf(image_data, image_mime, ocr=False)
+        photo_text = _docling_pdf_to_text(photo_pdf) if photo_pdf else None
+        _log_ai_timing("photo to text (PDF + Docling)", _t_photo, ok=bool(photo_text))
+        if photo_text:
+            message = f"{message}\n\nThe uploaded photo was converted to text (tables as Markdown):\n\n{photo_text}"
+            image_data = image_mime = None
+
     # If uploaded file is a JPEG/PNG, convert to OCR PDF before sending to AI.
     # ocrmypdf deskews phone photos and adds a text layer → more accurate extraction.
     _IMAGE_MIMES = {"image/jpeg", "image/jpg", "image/png"}
     _t_convert = _time.perf_counter()
-    _converting = bool(image_data and image_mime and image_mime in _IMAGE_MIMES)
-    if image_data and image_mime and image_mime in _IMAGE_MIMES:
-        import base64 as _b64
-        import io as _io
-        import os as _os
-        import tempfile as _tmp
-        try:
-            import img2pdf as _img2pdf
-            _ext = ".png" if image_mime == "image/png" else ".jpg"
-            with _tmp.NamedTemporaryFile(suffix=_ext, delete=False) as _f:
-                _f.write(_b64.b64decode(image_data))
-                _tmp_path = _f.name
-            try:
-                _pdf_bytes = _img2pdf.convert(_tmp_path)
-                try:
-                    import ocrmypdf as _ocr
-                    _in  = _io.BytesIO(_pdf_bytes)
-                    _out = _io.BytesIO()
-                    _ocr.ocr(_in, _out, deskew=True, force_ocr=True, progress_bar=False)
-                    _pdf_bytes = _out.getvalue()
-                except Exception:
-                    pass  # OCR failed — use plain img2pdf output
-                image_data = _b64.b64encode(_pdf_bytes).decode("utf-8")
-                image_mime = "application/pdf"
-                print("AI image→PDF: conversion successful, sending PDF to AI")
-            finally:
-                _os.unlink(_tmp_path)
-        except Exception:
+    _converting = bool(image_data and image_mime and image_mime in _IMAGE_MIMES and _reads_pdf)
+    if _converting:
+        _pdf_b64 = _photo_to_pdf(image_data, image_mime)
+        if _pdf_b64:
+            image_data = _pdf_b64
+            image_mime = "application/pdf"
+            print("AI image→PDF: conversion successful, sending PDF to AI")
+        else:
             print("AI image→PDF: conversion failed, sending original image to AI")
 
     if _converting:
@@ -1626,7 +1781,7 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
     # Route to provider
     kwargs = dict(message=message, system_prompt=system_prompt, history_list=history_list,
                   call_mcp=call_mcp, image_data=image_data, image_mime=image_mime,
-                  model=_pick_ai_model(has_image=bool(image_data)))
+                  model=_pick_ai_model(has_image=has_file))
 
     try:
         if ai_provider == "gemini":
@@ -1640,7 +1795,7 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
         else:
             frappe.throw(_(f"Unknown ai_provider '{ai_provider}'. Valid: gemini, claude, openrouter, bedrock, kimi, glm, deepseek"))
     finally:
-        _log_ai_timing("ask_document total", _t_request, provider=ai_provider, image=bool(image_data))
+        _log_ai_timing("ask_document total", _t_request, provider=ai_provider, image=has_file)
 
 
 # ─── "Load More" pagination for LIST_DATA responses ───────────────────────────
@@ -1650,7 +1805,7 @@ def ask_document(message, doctype=None, docname=None, image_data=None, image_mim
 # directly via MCP and returns just the new slice, since the list_documents
 # MCP tool has no separate "offset" parameter to rely on.
 @frappe.whitelist()
-def load_more_list_records(doctype, filters, fields, offset, page_size=10, total=None):
+def load_more_list_records(doctype, filters, fields, offset, page_size=10, total=None, selected_role=None):
     import json
     import requests
     from frappe.utils.password import get_decrypted_password
@@ -1667,8 +1822,21 @@ def load_more_list_records(doctype, filters, fields, offset, page_size=10, total
     if isinstance(fields, str):
         fields = json.loads(fields or "[]")
 
-    role_based_mode_on, role_based_token, _role_choices = _get_role_based_mcp_token(current_user)
+    # Client report, 2 Nov 2026 -- this used to call _get_role_based_mcp_token with no
+    # selected_role and allow_role_prompt left False (its default), so a user matching
+    # 2+ configured roles always fell through to role_based_mode_on=False here -- i.e.
+    # "use your own personal API key" -- even though the widget already had a role
+    # chosen (selected_ai_role, same one ask_document used for the original query that
+    # produced this LIST_DATA/"Load More" button in the first place). A dedicated
+    # per-role user with no personal key of their own then hit "MCP credentials not
+    # available for this user." on every Load More click. Passing selected_role +
+    # allow_role_prompt=True resolves the same token ask_document already used.
+    role_based_mode_on, role_based_token, role_choices = _get_role_based_mcp_token(
+        current_user, selected_role=selected_role, allow_role_prompt=True
+    )
     if role_based_mode_on and not role_based_token:
+        if role_choices:
+            frappe.throw(_("Select a role in the chat header, then try Load More again."))
         frappe.throw(_("You don't have access to this. Please contact admin."))
 
     if role_based_mode_on:
@@ -2014,6 +2182,163 @@ def _rows_from_mcp_list(result_text):
     return rows if isinstance(rows, list) else []
 
 
+# Closest-item search. The whole Item master is never read: the database looks the name up
+# first, so only a handful of rows ever reach the Python similarity check.
+_CLOSEST_ITEM_MAX = 10
+_CLOSEST_ITEM_FETCH_LIMIT = 100  # rows read per search step
+_CLOSEST_ITEM_STOP_SCORE = 0.95  # the search stops early at a near-certain match (not the same as "found")
+
+
+# Words are what a person types, so item names are compared word by word as well: letters and
+# digits are split apart ("K-12656" and "K12656" both give k + 12656, "1200x600" gives 1200 + 600),
+# case and punctuation are ignored, and order does not matter. An item that contains every word
+# of the search is shown even when the whole-name similarity is low, scored between
+# _ITEM_SUGGEST_THRESHOLD and _TOKEN_SCORE_CAP so it is offered, never picked automatically
+# at "exact" level.
+_TOKEN_SCORE_CAP = 0.85
+# attribute text an invoice may add after the name, e.g. "(Item Code 90648, Brand 74000, Tile Size 1200x600)"
+_ITEM_ATTRIBUTE_NOISE = _re.compile(r"\([^)]*\b(?:item\s*code|brand|size|hsn|sku)\b[^)]*\)", _re.IGNORECASE)
+
+
+def _clean_item_query(text):
+    return " ".join(_ITEM_ATTRIBUTE_NOISE.sub(" ", (text or "").replace("%", " ")).split())
+
+
+def _name_tokens(text):
+    """Lower-case runs of letters and runs of digits; one-letter words (the "k" of K-12656,
+    the "x" of 1200x600) carry no meaning and are dropped."""
+    return [t for t in _re.findall(r"[^\W\d_]+|\d+", (text or "").lower()) if not (len(t) == 1 and t.isalpha())]
+
+
+def _token_score(query_tokens, label):
+    """(score, share of the search words found in the item). A search word is found when the item
+    has it, or a longer word that starts with it. When all are found the score is
+    0.70 to _TOKEN_SCORE_CAP, higher the more of the item's own words the search uses."""
+    item_tokens = set(_name_tokens(label))
+    query_tokens = set(query_tokens)
+    if not query_tokens or not item_tokens:
+        return 0.0, 0.0
+    found = {q for q in query_tokens
+             if q in item_tokens or (len(q) >= 3 and q.isalpha() and any(t.startswith(q) for t in item_tokens))}
+    coverage = len(found) / len(query_tokens)
+    if coverage < 1.0:
+        return 0.6 * coverage, coverage
+    used = {t for t in item_tokens if any(t == q or (len(q) >= 3 and q.isalpha() and t.startswith(q)) for q in found)}
+    return min(_TOKEN_SCORE_CAP, _ITEM_SUGGEST_THRESHOLD + 0.25 * len(used) / len(item_tokens)), coverage
+
+
+def _closest_items(name, limit=_CLOSEST_ITEM_MAX):
+    """Up to `limit` active Items closest to `name`, best first, as
+    {"name", "item_name", "stock_uom", "score"} (score 0 to 1).
+
+    The database is searched in steps and only the rows found are scored:
+      1. items whose name contains ALL the longest words of the search, in any order
+      2. item name or code contains the full text, then its first 3, 2 and 1 words
+      3. items whose name contains ANY of the 3 longest words
+    It stops at the first step that finds an item with every search word, or one at least
+    _CLOSEST_ITEM_STOP_SCORE similar. A row's score is the better of the whole-name similarity and
+    the word score (_token_score). Runs as the logged-in user, so Item permissions apply."""
+    original = " ".join((name or "").replace("%", " ").split())
+    name = _clean_item_query(name)
+    if not name or name.isdigit():
+        return []
+
+    tokens = _name_tokens(name)
+    words = [t for t in dict.fromkeys(tokens) if len(t) >= 3 or (t.isdigit() and len(t) >= 2)]
+    by_length = sorted(words, key=lambda t: -len(t))
+    all_words, any_words = by_length[:4], [t for t in by_length if len(t) >= 3][:3]
+
+    leading = name.split()
+    texts = []
+    for text in [name] + [" ".join(leading[:n]) for n in (3, 2, 1)]:
+        if text and text not in texts:
+            texts.append(text)
+
+    steps = []
+    if all_words:
+        steps.append(("words", {"filters": [["disabled", "=", 0]] + [["item_name", "like", f"%{t}%"] for t in all_words]}))
+    for text in texts:
+        like = f"%{text}%"
+        steps.append(("text", {"filters": {"disabled": 0}, "or_filters": [["item_name", "like", like], ["item_code", "like", like]]}))
+    if len(any_words) > 1:
+        steps.append(("any", {"filters": {"disabled": 0}, "or_filters": [["item_name", "like", f"%{t}%"] for t in any_words]}))
+
+    found = {}
+    for kind, condition in steps:
+        rows = frappe.get_list(
+            "Item",
+            fields=["name", "item_name", "stock_uom"],
+            limit_page_length=_CLOSEST_ITEM_FETCH_LIMIT,
+            **condition,
+        )
+        every_word = False
+        for row in rows:
+            label = row.item_name or row.name
+            token_score, coverage = _token_score(tokens, label)
+            every_word = every_word or coverage >= 1.0
+            if row.name in found:
+                continue
+            similarity = max(_name_similarity(name, label), _name_similarity(name, row.name))
+            if original != name:
+                similarity = max(similarity, _name_similarity(original, label))
+            found[row.name] = {"name": row.name, "item_name": row.item_name, "stock_uom": row.stock_uom,
+                               "similarity": similarity, "words": token_score, "every_word": coverage >= 1.0}
+        if found and max(r["similarity"] for r in found.values()) >= _CLOSEST_ITEM_STOP_SCORE:
+            break
+        if kind == "words" and every_word:
+            break
+
+    # An item found only because it has all the search words may be preselected (from
+    # _FUZZY_MATCH_THRESHOLD up) when it is the one item that has them all. When several have
+    # them all the user chooses, so such a score stays below that line.
+    unique = sum(1 for r in found.values() if r["every_word"]) == 1
+    for r in found.values():
+        words_score = r["words"] if unique else min(r["words"], _FUZZY_MATCH_THRESHOLD - 0.01)
+        r["score"] = max(r["similarity"], words_score)
+    return sorted(found.values(), key=lambda r: -r["score"])[:limit]
+
+
+@frappe.whitelist()
+def find_closest_items(name, limit=_CLOSEST_ITEM_MAX):
+    """The Items closest to `name` (see _closest_items), as
+    [{"code", "label", "stock_uom", "score"}] with score in percent."""
+    if not frappe.has_permission("Item", "read"):
+        frappe.throw(_("You don't have permission to read Items."), frappe.PermissionError)
+    try:
+        limit = max(1, min(int(limit), 20))
+    except (TypeError, ValueError):
+        limit = _CLOSEST_ITEM_MAX
+    return [
+        {"code": r["name"], "label": r["item_name"] or r["name"], "stock_uom": r["stock_uom"], "score": int(r["score"] * 100 + 1e-9)}
+        for r in _closest_items(name, limit)
+    ]
+
+
+def _find_supplier_exact(name):
+    """The active Supplier whose name or supplier_name is exactly this text (capitals ignored), or None.
+    One database query, no list pulled; runs as the logged-in user so permissions apply."""
+    name = (name or "").strip()
+    if not name:
+        return None
+    rows = frappe.get_list(
+        "Supplier",
+        filters={"disabled": 0},
+        or_filters={"name": name, "supplier_name": name},
+        fields=["name", "supplier_name"],
+        limit_page_length=1,
+    )
+    return rows[0] if rows else None
+
+
+@frappe.whitelist()
+def check_supplier(name):
+    """Preview check: is this supplier in the system? {"found": bool, "name": ..., "supplier_name": ...}"""
+    row = _find_supplier_exact(name)
+    if not row:
+        return {"found": False}
+    return {"found": True, "name": row["name"], "supplier_name": row.get("supplier_name") or row["name"]}
+
+
 @frappe.whitelist()
 def match_items(names):
     """How each extracted item name relates to the Item master, so the preview can
@@ -2021,13 +2346,11 @@ def match_items(names):
 
     Per name returns {"status", "candidates"} where candidates are up to 5 items at
     least 70% similar, best first, as {"code", "label", "score"} (score in percent):
-      "exact"   95% or more   treated as found, nothing to choose
-      "pick"    80% to <95%   dropdown, best match preselected
+      "exact"   100%          treated as found, nothing to choose
+      "pick"    80% to 99%    dropdown, best match preselected
       "suggest" 70% to <80%   dropdown, nothing preselected
       "none"    below 70%     not in the system (Create warns, as before)"""
     import json
-    import requests
-    from frappe.utils.password import get_decrypted_password
 
     if not frappe.has_permission("Purchase Invoice", "create"):
         frappe.throw(_("You don't have permission to create a Purchase Invoice."), frappe.PermissionError)
@@ -2036,55 +2359,21 @@ def match_items(names):
         names = json.loads(names)
     names = [str(n or "") for n in (names or [])][:100]
 
-    current_user    = frappe.session.user
-    _mcp_api_key    = frappe.db.get_value("User", current_user, "api_key")
-    _mcp_api_secret = None
-    if _mcp_api_key:
-        try:
-            _mcp_api_secret = get_decrypted_password("User", current_user, "api_secret")
-        except Exception:
-            _mcp_api_secret = None
-
-    def _call_mcp(tool_name, tool_args):
-        fac_api_key    = _mcp_api_key
-        fac_api_secret = _mcp_api_secret
-        try:
-            resp = requests.post(
-                _mcp_url(),
-                headers={"Authorization": f"token {fac_api_key}:{fac_api_secret}", "Content-Type": "application/json"},
-                json={"jsonrpc": "2.0", "method": "tools/call", "params": {"name": tool_name, "arguments": tool_args}, "id": 1},
-                timeout=30
-            )
-            if resp.status_code == 200:
-                content = resp.json().get("result", {}).get("content", [])
-                if content and isinstance(content, list):
-                    return content[0].get("text", "")
-        except Exception:
-            pass
-        return ""
-
-    item_master = _rows_from_mcp_list(_call_mcp("list_documents", {
-        "doctype": "Item",
-        "filters": {"disabled": 0},
-        "fields": ["name", "item_name", "stock_uom"],
-        "limit": 1000
-    }))
-
     out = []
     for raw in names:
         raw = raw.strip()
         scored = []
         # a purely numeric "name" is a row/serial number picked up from the table, not a product
         if raw and not raw.isdigit():
-            for candidate in item_master:
-                label = candidate.get("item_name") or candidate.get("name") or ""
-                score = _name_similarity(raw, label)
-                if score >= _ITEM_SUGGEST_THRESHOLD:
-                    scored.append((score, candidate))
+            # a database failure is raised, so the preview says the check failed
+            # instead of reporting every item as "not in the system"
+            for candidate in _closest_items(raw):
+                if candidate["score"] >= _ITEM_SUGGEST_THRESHOLD:
+                    scored.append((candidate["score"], {"name": candidate["name"], "item_name": candidate["item_name"]}))
         scored.sort(key=lambda pair: -pair[0])
 
         top = scored[0][0] if scored else 0.0
-        if top >= _ITEM_AUTO_THRESHOLD:
+        if top >= _ITEM_AUTO_THRESHOLD - 1e-9:
             status = "exact"
         elif top >= _FUZZY_MATCH_THRESHOLD:
             status = "pick"
@@ -2104,6 +2393,60 @@ def match_items(names):
 
 
 # ─── Purchase Invoice creation ────────────────────────────────────────────────
+
+# ─── What ERPNext fills in the Desk the moment a Supplier / Item is picked ───────────
+# A document built from extracted image data is assigned field by field, so that
+# client-side step never runs. doc.flags.ignore_validate (used so an incomplete AI draft
+# can still be saved) also skips Frappe's title auto-fill. These helpers do the same
+# lookups from whatever supplier, company and items are on the document, so nothing is
+# tied to one invoice, and they never overwrite a value that is already set.
+
+def _default_expense_account(item_code, company):
+    """The expense account ERPNext puts on a purchase line for this item, in the order of
+    erpnext.stock.get_item_details.get_default_expense_account: the Item's own default for
+    the company, then its Item Group's, then its Brand's, then the Company default."""
+    if not item_code or not company:
+        return None
+    account = frappe.db.get_value(
+        "Item Default", {"parent": item_code, "parenttype": "Item", "company": company}, "expense_account")
+    if not account:
+        item_group, brand = frappe.db.get_value("Item", item_code, ["item_group", "brand"]) or (None, None)
+        if item_group:
+            account = frappe.db.get_value(
+                "Item Default", {"parent": item_group, "parenttype": "Item Group", "company": company}, "expense_account")
+        if not account and brand:
+            account = frappe.db.get_value(
+                "Item Default", {"parent": brand, "parenttype": "Brand", "company": company}, "expense_account")
+    return account or frappe.db.get_value("Company", company, "default_expense_account")
+
+
+def _backfill_purchase_invoice_defaults(doc):
+    """credit_to, party_account_currency and supplier_address from the Supplier, expense_account
+    on every line from the item's defaults, and the title (supplier_name)."""
+    company = doc.company or frappe.defaults.get_user_default("company")
+
+    if doc.supplier and not doc.credit_to:
+        try:
+            from erpnext.accounts.party import get_party_account_currency, get_party_details
+
+            details = get_party_details(party=doc.supplier, party_type="Supplier", company=company, doctype="Purchase Invoice")
+            doc.credit_to = details.get("credit_to") or doc.credit_to
+            doc.party_account_currency = doc.party_account_currency or get_party_account_currency("Supplier", doc.supplier, company)
+            # The Supplier's own default Address record, never one the model guessed.
+            if not doc.supplier_address and details.get("supplier_address"):
+                doc.supplier_address = details["supplier_address"]
+        except Exception:
+            frappe.log_error(frappe.get_traceback(), "AI PI: get_party_details failed")
+
+    for row in doc.items:
+        if row.expense_account:
+            continue
+        account = _default_expense_account(row.item_code, company)
+        if account:
+            row.expense_account = account
+
+    doc.set_title_field()
+
 
 @frappe.whitelist()
 def create_purchase_invoice_from_data(data):
@@ -2190,31 +2533,8 @@ def create_purchase_invoice_from_data(data):
         matched_rows = []
 
         if items_to_match:
-            # ONE MCP call — fetch all active items from production
-            mcp_result = _call_mcp("list_documents", {
-                "doctype": "Item",
-                "filters": {"disabled": 0},
-                "fields": ["name", "item_name", "stock_uom"],
-                "limit": 1000
-            })
-            item_master = []
-            try:
-                parsed_result = json.loads(mcp_result or "[]")
-                if isinstance(parsed_result, list):
-                    item_master = parsed_result
-                elif isinstance(parsed_result, dict):
-                    # MCP wraps as {"success": true, "result": {"data": [...]}}
-                    inner = parsed_result.get("result", parsed_result)
-                    if isinstance(inner, list):
-                        item_master = inner
-                    elif isinstance(inner, dict):
-                        item_master = inner.get("data", inner.get("message", []))
-                    if not item_master:
-                        item_master = parsed_result.get("data", parsed_result.get("message", []))
-            except Exception:
-                pass
-
-            # Fuzzy-match every image item against full Item master list
+            # Each image item is looked up in the database (closest few Items only);
+            # the Item master is never read in full.
             for item_name_raw, item in items_to_match:
 
                 # Purely numeric item_name_raw means Gemini picked up a row/serial number — skip it.
@@ -2225,22 +2545,16 @@ def create_purchase_invoice_from_data(data):
                 best, best_score = None, 0.0
                 chosen_code = str(item.get("matched_item_code") or "").strip()
                 if chosen_code:
-                    best = next((c for c in item_master if c.get("name") == chosen_code), None)
-                    if not best:
-                        # Not among the 1000 rows fetched above, but a real active Item.
-                        best = frappe.db.get_value(
-                            "Item", {"name": chosen_code, "disabled": 0}, ["name", "item_name", "stock_uom"], as_dict=True
-                        )
+                    best = frappe.db.get_value(
+                        "Item", {"name": chosen_code, "disabled": 0}, ["name", "item_name", "stock_uom"], as_dict=True
+                    )
                     if best:
                         best_score = 1.0
 
                 if not best:
-                    for candidate in item_master:
-                        cname = candidate.get("item_name") or candidate.get("name") or ""
-                        score = _similarity(item_name_raw, cname)
-                        if score > best_score:
-                            best_score = score
-                            best = candidate
+                    closest = _closest_items(item_name_raw, 1)
+                    if closest:
+                        best, best_score = closest[0], closest[0]["score"]
 
                 if best and best_score >= _FUZZY_MATCH_THRESHOLD:
                     qty = float(item.get("qty", 1)) or 1.0
@@ -2275,42 +2589,17 @@ def create_purchase_invoice_from_data(data):
                     not_found.append(item_name_raw)
 
         raw_supplier_name = (pi_data.get("supplier") or pi_data.get("supplier_name") or "").strip()
-        if raw_supplier_name:
-            supplier_result = _call_mcp("list_documents", {
-                "doctype": "Supplier",
-                "filters": {"disabled": 0},
-                "fields": ["name", "supplier_name"],
-                "limit": 1000
-            })
-            supplier_master = []
-            try:
-                parsed_supplier = json.loads(supplier_result or "[]")
-                if isinstance(parsed_supplier, list):
-                    supplier_master = parsed_supplier
-                elif isinstance(parsed_supplier, dict):
-                    inner = parsed_supplier.get("result", parsed_supplier)
-                    if isinstance(inner, list):
-                        supplier_master = inner
-                    elif isinstance(inner, dict):
-                        supplier_master = inner.get("data", inner.get("message", []))
-                    if not supplier_master:
-                        supplier_master = parsed_supplier.get("data", parsed_supplier.get("message", []))
-            except Exception:
-                pass
-
-            best_supplier, best_supplier_score = None, 0.0
-            for candidate in supplier_master:
-                cname = candidate.get("supplier_name") or candidate.get("name") or ""
-                score = _similarity(raw_supplier_name, cname)
-                if score > best_supplier_score:
-                    best_supplier_score = score
-                    best_supplier = candidate
-
-            if best_supplier and best_supplier_score >= _FUZZY_MATCH_THRESHOLD:
-                pi_data["supplier"] = best_supplier.get("name")
-                pi_data["supplier_name"] = best_supplier.get("supplier_name") or best_supplier.get("name")
+        if raw_supplier_name or pi_data.get("matched_supplier"):
+            # The supplier tagged in the preview wins; otherwise one exact lookup (no list of suppliers is read).
+            chosen = str(pi_data.get("matched_supplier") or "").strip()
+            supplier_row = _find_supplier_exact(chosen) if chosen else None
+            if not supplier_row:
+                supplier_row = _find_supplier_exact(raw_supplier_name)
+            if supplier_row:
+                pi_data["supplier"] = supplier_row["name"]
+                pi_data["supplier_name"] = supplier_row.get("supplier_name") or supplier_row["name"]
             else:
-                not_found.append(f"Supplier: {raw_supplier_name}")
+                not_found.append(f"Supplier: {raw_supplier_name or chosen}")
 
         if not_found:
             return {
@@ -2364,7 +2653,7 @@ def create_purchase_invoice_from_data(data):
         doc = frappe.new_doc("Purchase Invoice")
 
         skip_fields = {"items", "taxes", "taxes_and_charges", "payment_schedule",
-                       "doctype", "name", "owner", "creation", "modified"}
+                       "doctype", "name", "owner", "creation", "modified", "matched_supplier"}
         _non_data_fieldtypes = {"Section Break", "Column Break", "Tab Break", "Fold",
                                  "HTML", "Button", "Heading", "Table", "Table MultiSelect"}
         _valid_fieldnames = {df.fieldname for df in doc.meta.fields if df.fieldtype not in _non_data_fieldtypes}
@@ -2611,6 +2900,8 @@ def create_purchase_invoice_from_data(data):
             needs_manual_review = True
             review_reason = "Could not read tax details from the invoice image — a generic tax template was applied instead. Please verify tax amounts manually."
 
+        _backfill_purchase_invoice_defaults(doc)
+
         doc.flags.ignore_mandatory = True
         doc.flags.ignore_validate  = True
         doc.flags.ignore_links     = True
@@ -2730,39 +3021,16 @@ def create_quotation_from_data(data):
         matched_rows = []
 
         if items_to_match:
-            mcp_result = _call_mcp("list_documents", {
-                "doctype": "Item",
-                "filters": {"disabled": 0},
-                "fields": ["name", "item_name", "stock_uom"],
-                "limit": 1000
-            })
-            item_master = []
-            try:
-                parsed_result = json.loads(mcp_result or "[]")
-                if isinstance(parsed_result, list):
-                    item_master = parsed_result
-                elif isinstance(parsed_result, dict):
-                    inner = parsed_result.get("result", parsed_result)
-                    if isinstance(inner, list):
-                        item_master = inner
-                    elif isinstance(inner, dict):
-                        item_master = inner.get("data", inner.get("message", []))
-                    if not item_master:
-                        item_master = parsed_result.get("data", parsed_result.get("message", []))
-            except Exception:
-                pass
-
+            # Each item is looked up in the database (closest few Items only);
+            # the Item master is never read in full.
             for item_name_raw, item in items_to_match:
                 if item_name_raw.isdigit():
                     continue
 
                 best, best_score = None, 0.0
-                for candidate in item_master:
-                    cname = candidate.get("item_name") or candidate.get("name") or ""
-                    score = _similarity(item_name_raw, cname)
-                    if score > best_score:
-                        best_score = score
-                        best = candidate
+                closest = _closest_items(item_name_raw, 1)
+                if closest:
+                    best, best_score = closest[0], closest[0]["score"]
 
                 if best and best_score >= _FUZZY_MATCH_THRESHOLD:
                     qty = float(item.get("qty", 1)) or 1.0
@@ -3070,6 +3338,10 @@ def create_quotation_from_data(data):
         if tax_fallback_used and not needs_manual_review:
             needs_manual_review = True
             review_reason = "Could not read tax details from the quotation image — a generic tax template was applied instead. Please verify tax amounts manually."
+
+        # The title normally fills from customer_name on a standard save, but ignore_validate
+        # below skips that step, so trigger it here.
+        doc.set_title_field()
 
         doc.flags.ignore_mandatory = True
         doc.flags.ignore_validate  = True
