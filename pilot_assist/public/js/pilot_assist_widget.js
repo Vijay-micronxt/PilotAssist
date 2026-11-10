@@ -1,64 +1,27 @@
 (function () {
 
-const SHOW_QUICK_PROMPTS = false;
-
-const AI_CHAT_PROMPTS = {
-    "Purchase Invoice": [
-        { label: "Compare image with invoice", prompt: "Compare the uploaded image with this invoice and highlight any mismatches" },
-        { label: "Summarize this invoice", prompt: "Summarize this invoice" },
-        { label: "Total amount?", prompt: "What is the Total amount?" },
-        { label: "List all items", prompt: "List all line items with quantities and amounts" },
-        { label: "Is this overdue?", prompt: "Is this invoice overdue? Check due date vs today" },
-        { label: "GST compliance check", prompt: "Check GST compliance — verify GSTIN, HSN code, tax amount, place of supply are present" },
-    ],
-    "Purchase Receipt": [
-        { label: "Compare delivery challan", prompt: "Compare the uploaded delivery challan with this Purchase Receipt and highlight any quantity or item mismatches" },
-        { label: "Any quantity mismatches?", prompt: "Are there any quantity mismatches between received and ordered?" },
-        { label: "List items received", prompt: "List all items received with quantities" },
-    ],
-    "Payment Entry": [
-        { label: "Verify payment proof", prompt: "Verify the uploaded payment proof against this Payment Entry — check amount, date, and reference number" },
-        { label: "Does amount match?", prompt: "Does the amount in the uploaded image match this payment entry?" },
-        { label: "Payment details", prompt: "Summarize this payment entry" },
-    ],
-    "Sales Order": [
-        { label: "Compare customer PO", prompt: "Compare the uploaded customer Purchase Order with this Sales Order — highlight item, quantity, rate, and delivery date mismatches" },
-        { label: "Any mismatches?", prompt: "Are there any mismatches between the uploaded document and this Sales Order?" },
-        { label: "Delivery dates match?", prompt: "Do the delivery dates in the uploaded document match this Sales Order?" },
-    ],
-    "Quotation": [
-        { label: "Compare competitor quote", prompt: "Compare the uploaded competitor quote with our Quotation — show where we are priced higher and by how much" },
-        { label: "Where are we priced higher?", prompt: "List all items where our price is higher than the uploaded competitor quote" },
-        { label: "Summarize quotation", prompt: "Summarize this quotation" },
-    ],
-    "Purchase Order": [
-        { label: "Compare packing list", prompt: "Compare the uploaded packing list with this Purchase Order — catch any wrong items or quantities" },
-        { label: "Any wrong items?", prompt: "Are there any wrong items or quantities in the uploaded packing list compared to this Purchase Order?" },
-        { label: "List ordered items", prompt: "List all items ordered with quantities and rates" },
-    ],
-    "Expense Claim": [
-        { label: "Verify receipt", prompt: "Verify the uploaded receipt against this expense claim — check amount, date, and vendor name" },
-        { label: "Amount correct?", prompt: "Does the receipt amount match the claimed amount?" },
-        { label: "Date within policy?", prompt: "Is the receipt date within the claim policy period?" },
-    ],
-};
-
-const DEFAULT_PROMPTS = [
-    { label: "Sales invoices this month", prompt: "Show me the sales invoices created this month" },
-    { label: "Total customers", prompt: "What is the total number of customers?" },
-    { label: "Top 5 customers who paid more", prompt: "List out the top 5 customers who paid the most" },
-    { label: "Pending purchase invoices", prompt: "Show me all draft and pending purchase invoices" },
-    { label: "Create purchase invoice", prompt: "I want to create a purchase invoice from an uploaded invoice image. Please guide me or process the uploaded image." },
-    { label: "Create quotation", prompt: "I want to create a quotation from an uploaded quotation image. Please guide me or process the uploaded image." },
-    { label: "Customer outstanding", prompt: "Show me the outstanding payment amounts from customers" },
-    { label: "Overdue purchase invoices", prompt: "Show me all purchase invoices that are past due date and not yet paid" },
-    { label: "Total sales this month", prompt: "What is the total sales revenue for this month?" },
-    { label: "Low stock items", prompt: "Show me the items which have less stock" },
-    { label: "Top suppliers", prompt: "List the top 5 suppliers by total purchase amount" },
-];
+// Two fixed quick-prompt buttons sit above the message box (no dropdown).
+// "Create purchase invoice" sends this request for the files already picked;
+// "Ask your own question" only focuses the box so anything can be typed.
+const AI_QUICK_CREATE_PI_MESSAGE = 'create purchase invoice';
 
 const _company = frappe.boot && frappe.boot.sysdefaults && frappe.boot.sysdefaults.company;
 const ai_title = _company ? ('I' + _company) : 'I&lt;company_name&gt;';
+
+// Header color: site_config.json > enable_ai_assistant > header_color (sent in boot as
+// ai_header_color). This blue is the default, and what any invalid value falls back to.
+// The text switches to dark on a light color so the title and the close button stay readable.
+const AI_DEFAULT_HEADER_COLOR = '#5b8def';
+function _ai_header_colors() {
+    let bg = String((frappe.boot && frappe.boot.ai_header_color) || '').trim();
+    if (!/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(bg)) bg = AI_DEFAULT_HEADER_COLOR;
+    let hex = bg.slice(1);
+    if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+    const [r, g, b] = [0, 2, 4].map(i => parseInt(hex.substr(i, 2), 16));
+    const lin = v => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+    const luminance = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    return { bg: bg, fg: luminance > 0.45 ? '#1e293b' : '#ffffff' };
+}
 
 // Site's own configured logo (System Settings / Website > App Logo) instead
 // of a hardcoded emoji — falls back to the robot emoji if the site hasn't
@@ -187,12 +150,14 @@ function open_ai_panel() {
     let image_data = null;
     let image_mime = null;
 
-    const route = frappe.get_route();
-    const on_form = route && route[0] === 'Form' && route[1] && route[2];
-    const prompts = (on_form && AI_CHAT_PROMPTS[route[1]]) ? AI_CHAT_PROMPTS[route[1]] : DEFAULT_PROMPTS;
-    const prompt_buttons = prompts.map(p =>
-        `<button class="ai-suggestion-btn btn btn-xs btn-default" data-prompt="${p.prompt}" style="margin:2px 2px 4px 0;">${p.label}</button>`
-    ).join('');
+    // Every file picked and not yet answered: {id, name, mime, data, thumb, status}.
+    // New picks are ADDED to this list; the single-file fields above and bulk_files
+    // are derived from it by syncStaged().
+    let staged_files = [];
+    let _staged_seq = 0;
+    // What each sent message carried, so Retry resends the same file even after
+    // the upload area was cleared when the first answer arrived.
+    const sent_files = {};
 
     // Role-based mode: header dropdown lets the user see/pick which matched
     // role their chat should use, when they have 2+ options (see
@@ -213,6 +178,7 @@ function open_ai_panel() {
             localStorage.setItem(_role_storage_key, selected_ai_role);
         }
     }
+    const _hdr = _ai_header_colors();
     const role_dropdown_html = ai_role_choices.length > 1
         ? `<select class="ai-role-dropdown" style="font-size:11px;padding:2px 6px;border-radius:4px;border:none;background:rgba(255,255,255,0.9);color:#333;">
             ${ai_role_choices.map(r => `<option value="${r}"${r === selected_ai_role ? ' selected' : ''}>${r}</option>`).join('')}
@@ -261,11 +227,11 @@ function open_ai_panel() {
         ${is_mobile_view ? '' : '<div id="ai-drag-handle" style="position:absolute;left:0;top:0;width:5px;height:100%;cursor:col-resize;background:transparent;z-index:1;"></div>'}
 
         <!-- Header -->
-        <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:#5b8def;color:white;flex-shrink:0;">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #e2e8f0;background:${_hdr.bg};color:${_hdr.fg};flex-shrink:0;">
             <span style="font-weight:600;font-size:15px;min-width:0;">${_ai_logo_html(20)} ${ai_title}</span>
             <div style="display:flex;align-items:center;gap:10px;flex-shrink:0;">
                 ${role_dropdown_html}
-                <button id="ai-panel-close" style="background:none;border:none;color:white;font-size:20px;cursor:pointer;line-height:1;padding:0 4px;">×</button>
+                <button id="ai-panel-close" style="background:none;border:none;color:${_hdr.fg};font-size:20px;cursor:pointer;line-height:1;padding:0 4px;">×</button>
             </div>
         </div>
 
@@ -275,27 +241,30 @@ function open_ai_panel() {
         <!-- Bottom area -->
         <div style="border-top:1px solid #e2e8f0;padding:10px;flex-shrink:0;background:#f8fafc;">
 
-            <!-- File upload -->
+            <!-- File upload: picks are added to the list below; each file has its own X -->
             <div style="margin-bottom:8px;">
-                <input type="file" class="ai-file-input" accept="image/*,application/pdf" multiple
-                    style="display:block;width:100%;padding:4px;border:1px solid #ddd;border-radius:4px;font-size:11px;background:white;">
-                <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
-                    <div class="ai-file-preview" style="font-size:11px;color:#888;flex:1;"></div>
-                    <button class="ai-file-remove btn btn-xs btn-danger" style="display:none;">Remove</button>
-                </div>
+                <label class="ai-file-add" style="display:flex;align-items:center;justify-content:center;gap:6px;width:100%;min-height:24px;margin:0;padding:1px 10px;border:1px dashed #94a3b8;border-radius:6px;font-size:12px;color:#334155;background:#fff;cursor:pointer;">
+                    <span>📎 Add invoice, image or PDF</span>
+                    <input type="file" class="ai-file-input" accept="image/*,application/pdf" multiple style="display:none;">
+                </label>
+                <div class="ai-file-preview" style="font-size:11px;color:#64748b;margin-top:4px;"></div>
             </div>
 
-            <!-- Quick prompts (collapsed by default) -->
-            ${SHOW_QUICK_PROMPTS ? `
-            <div style="margin-bottom:8px;">
-                <div class="ai-quick-prompts-toggle" style="font-size:11px;color:#888;margin-bottom:4px;cursor:pointer;user-select:none;display:flex;align-items:center;gap:4px;">
-                    <span class="ai-quick-prompts-arrow">▾</span> Quick prompts
-                </div>
-                <div class="ai-quick-prompts-list" style="display:none;flex-wrap:wrap;">${prompt_buttons}</div>
-            </div>` : ''}
+            <!-- Quick prompts: two fixed buttons above the message box -->
+            <div class="ai-quick-row" style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px;">
+                <button class="ai-quick-pi btn btn-xs btn-default" style="min-height:32px;padding:4px 8px;border-radius:16px;font-size:11px;white-space:nowrap;">🧾 Create purchase invoice</button>
+                <button class="ai-quick-custom btn btn-xs btn-default" style="min-height:32px;padding:4px 8px;border-radius:16px;font-size:11px;white-space:nowrap;">✍️ Ask your own question</button>
+            </div>
+
+            <!-- "Ask your own question": the box opens here, in place of the two buttons. -->
+            <div class="ai-quick-custom-box" style="display:none;gap:6px;align-items:stretch;margin-bottom:8px;">
+                <input type="text" class="ai-quick-custom-input form-control" placeholder="Type your own question..." style="flex:1;min-width:0;font-size:14px;height:38px;border:1.5px solid #b0b7c3;color:#333;">
+                <button class="ai-quick-custom-send btn btn-primary btn-sm" style="white-space:nowrap;height:38px;">Send</button>
+                <button class="ai-quick-custom-cancel btn btn-default btn-sm" title="Cancel" aria-label="Cancel" style="height:38px;min-width:38px;">✕</button>
+            </div>
 
             <!-- Message input + Mic + Send (mic only if Sarvam speech-to-text is configured) -->
-            <div style="display:flex;gap:6px;align-items:stretch;">
+            <div class="ai-input-row" style="display:flex;gap:6px;align-items:stretch;">
                 ${frappe.boot.enable_speech_to_text ? `
                 <div style="position:relative;display:inline-block;">
                     <div class="ai-mic-tooltip" style="display:none;position:absolute;bottom:calc(100% + 8px);${is_mobile_view ? 'left:0;' : 'left:50%;transform:translateX(-50%);'}background:#1e293b;color:#fff;font-size:11px;padding:5px 10px;border-radius:6px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.2);z-index:10;">
@@ -383,19 +352,6 @@ function open_ai_panel() {
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', onMouseUp);
 
-    // Quick prompts toggle — collapsed by default (see the ai-quick-prompts-list
-    // display:none above); click the label to expand/collapse, arrow flips too.
-    const quickPromptsToggle = panel.querySelector('.ai-quick-prompts-toggle');
-    const quickPromptsList = panel.querySelector('.ai-quick-prompts-list');
-    const quickPromptsArrow = panel.querySelector('.ai-quick-prompts-arrow');
-    if (quickPromptsToggle && quickPromptsList && quickPromptsArrow) {
-        quickPromptsToggle.addEventListener('click', function () {
-            const isOpen = quickPromptsList.style.display !== 'none';
-            quickPromptsList.style.display = isOpen ? 'none' : 'flex';
-            quickPromptsArrow.textContent = isOpen ? '▾' : '▴';
-        });
-    }
-
     document.getElementById('ai-panel-close').addEventListener('click', function () {
         document.body.classList.add('ai-modal-active');
 
@@ -437,6 +393,34 @@ function open_ai_panel() {
     let conversation_history = [];
 
     let is_ai_busy = false;
+
+    // Quick prompts: while one is running (quick_busy) the message box and Send button
+    // are hidden until its answer is complete. quick_custom_open is the "Ask your own
+    // question" box, which replaces the two buttons while it is open.
+    let quick_busy = false;
+    let quick_custom_open = false;
+
+    // Copy button under a finished AI answer, same look as the one under the
+    // user's own message. getText() runs on click, so rows added later (Load More)
+    // are included. Shown only once the answer is complete, never on "Thinking...".
+    function _addResponseCopy(el, getText) {
+        if (!el) return;
+        const old = el.querySelector('.ai-resp-actions');
+        if (old) old.remove();
+        el.insertAdjacentHTML('beforeend', `<div class="ai-resp-actions" style="text-align:left;margin:2px 0 4px;">
+            <button class="ai-resp-copy-btn" style="background:transparent !important;box-shadow:none;border:none;cursor:pointer;font-size:9px;color:#333;padding:1px 4px;display:inline-flex;align-items:center;gap:3px;">
+                <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                Copy
+            </button>
+        </div>`);
+        el.querySelector('.ai-resp-copy-btn').addEventListener('click', function () {
+            navigator.clipboard.writeText(getText()).then(() => {
+                const original = this.innerHTML;
+                this.innerHTML = 'Copied';
+                setTimeout(() => { this.innerHTML = original; }, 1200);
+            });
+        });
+    }
 
     // Bulk upload: several invoices picked at once are queued here and sent to
     // ask_document one at a time, each as its own isolated request.
@@ -521,14 +505,22 @@ function open_ai_panel() {
         const current_doctype = active_doctype;
         const current_docname = active_docname;
 
+        // The file this message carries. A retry sends the same file again, even
+        // though it left the upload area when the first answer arrived.
+        if (!retryOf && image_data) sent_files[msg_id] = { data: image_data, mime: image_mime };
+        const req_file = retryOf ? (sent_files[msg_id] || { data: null, mime: null }) : { data: image_data, mime: image_mime };
+        // A single picked file leaves the upload area once its answer is in. Only that
+        // file is removed, so anything picked while waiting stays.
+        const sent_ids = (!retryOf && !bulk_run_active && staged_files.length === 1 && image_data) ? [staged_files[0].id] : [];
+
         frappe.call({
             method: 'pilot_assist.api.ai_api.ask_document',
             args: {
                 message: message,
                 doctype: current_doctype,
                 docname: current_docname,
-                image_data: image_data,
-                image_mime: image_mime,
+                image_data: req_file.data,
+                image_mime: req_file.mime,
                 history: JSON.stringify(bulk_run_active ? [] : conversation_history.slice(-6)),
                 selected_role: selected_ai_role
             },
@@ -586,8 +578,8 @@ function open_ai_panel() {
                             return `<div style="padding:4px 0;border-bottom:1px solid #f1f5f9;">${chips}</div>`;
                         }).join('');
 
-                        const imgSrc = image_data ? `data:${image_mime||'image/jpeg'};base64,${image_data}` : '';
-                        const isPdf  = image_mime === 'application/pdf';
+                        const imgSrc = req_file.data ? `data:${req_file.mime||'image/jpeg'};base64,${req_file.data}` : '';
+                        const isPdf  = req_file.mime === 'application/pdf';
                         const leftPanel = `
                             <div id="${pid}-left" style="flex:1;min-width:0;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px;overflow:auto;max-height:520px;">
                                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;border-bottom:1px solid #e2e8f0;padding-bottom:4px;">
@@ -747,6 +739,7 @@ function open_ai_panel() {
                         const wrapper = document.getElementById(pid);
                         if (bulkCard) _bulkBindItem(wrapper, bulkRun);
                         _initItemMatching(wrapper, pid);
+                        _initSupplierMatching(wrapper, pid);
 
                         // Left panel toggle — switch between extracted fields and uploaded image
                         const toggleBtn = wrapper.querySelector(`#${pid}-toggle-left`);
@@ -833,6 +826,7 @@ function open_ai_panel() {
                             const newBase    = newRegSub + newChgSub;
                             newMapped.grand_total = Math.round((newBase + newBase * taxRate / 100) * 100) / 100;
 
+                            if (wrapper.dataset.supplier) newMapped.matched_supplier = wrapper.dataset.supplier; else delete newMapped.matched_supplier;
                             const newPiData = Object.assign({}, pi_data, { mapped_data: newMapped });
                             wrapper.querySelector('.ai-create-pi-btn').setAttribute('data-pi', JSON.stringify(newPiData));
 
@@ -942,8 +936,8 @@ function open_ai_panel() {
                             return `<div style="padding:4px 0;border-bottom:1px solid #f1f5f9;">${chips}</div>`;
                         }).join('');
 
-                        const qImgSrc = image_data ? `data:${image_mime||'image/jpeg'};base64,${image_data}` : '';
-                        const qIsPdf  = image_mime === 'application/pdf';
+                        const qImgSrc = req_file.data ? `data:${req_file.mime||'image/jpeg'};base64,${req_file.data}` : '';
+                        const qIsPdf  = req_file.mime === 'application/pdf';
                         const leftPanel = `
                             <div id="${qid}-left" style="flex:1;min-width:0;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px;overflow:auto;max-height:520px;">
                                 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;border-bottom:1px solid #e2e8f0;padding-bottom:4px;">
@@ -1288,6 +1282,13 @@ function open_ai_panel() {
                                 <div style="overflow-x:auto;">${tableHtml}</div>
                                 ${showMoreBtn}
                             </div>`;
+                            // Copy gives the summary plus the table as tab-separated rows
+                            // (pastes straight into Excel), including rows added by Load More.
+                            _addResponseCopy(el, () => {
+                                const tbl = el.querySelector('table');
+                                const tsv = tbl ? Array.from(tbl.rows).map(r => Array.from(r.cells).map(c => c.textContent.trim()).join('\t')).join('\n') : '';
+                                return [list_data.summary || '', tsv].filter(Boolean).join('\n\n');
+                            });
 
                             let offset = rows.length;
                             const moreBtn = el.querySelector(`#${lid}-more`);
@@ -1303,7 +1304,8 @@ function open_ai_panel() {
                                             filters: JSON.stringify(list_data.filters || {}),
                                             fields: JSON.stringify(list_data.fields || []),
                                             offset: offset,
-                                            page_size: 10
+                                            page_size: 10,
+                                            selected_role: selected_ai_role
                                         },
                                         callback: function (r) {
                                             const more = r.message || {};
@@ -1347,7 +1349,10 @@ function open_ai_panel() {
                     // turns that Markdown link into a real clickable <a> automatically,
                     // same as it already does for tables and any other markdown.
                     let formatted = _ai_markdown_to_html(response_text);
-                    if (el) el.innerHTML = `<div style="background:#f0f0f0;padding:6px 10px;border-radius:10px;">${formatted}</div>`;
+                    if (el) {
+                        el.innerHTML = `<div style="background:#f0f0f0;padding:6px 10px;border-radius:10px;">${formatted}</div>`;
+                        _addResponseCopy(el, () => response_text);
+                    }
                 }
 
                 history.scrollTop = history.scrollHeight;
@@ -1356,8 +1361,15 @@ function open_ai_panel() {
                     conversation_history.push({ role: "model", content: response_text });
                 }
 
+                // The answer is in: the file that was just sent leaves the upload area.
+                if (sent_ids.length) {
+                    staged_files = staged_files.filter(f => !sent_ids.includes(f.id));
+                    syncStaged();
+                }
+
                 is_ai_busy = false;
                 if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; }
+                if (quick_busy && !bulk_run_active) _quickDone();
             },
             error: function () {
                 // Without this, a failed request leaves the "Thinking..." bubble stuck
@@ -1371,6 +1383,7 @@ function open_ai_panel() {
 
                 is_ai_busy = false;
                 if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = 'Send'; }
+                if (quick_busy && !bulk_run_active) _quickDone();
             }
         });
     }
@@ -1504,11 +1517,92 @@ function open_ai_panel() {
     });
     }
 
-    // Quick prompt buttons
-    panel.querySelectorAll('.ai-suggestion-btn').forEach(btn => {
-        btn.addEventListener('click', function () {
-            submitMessage(this.getAttribute('data-prompt'));
-        });
+    // ── Quick prompts ────────────────────────────────────────────────────────
+    // What is on screen at the bottom:
+    //   normal            the two buttons, then the message box + Send
+    //   box open          only the "Ask your own question" box (the two buttons and the
+    //                     message box step aside so there is one place to type)
+    //   a quick prompt    the message box and Send are hidden until the answer is
+    //   is running        complete, then everything is back as it was
+    const _quickRow = panel.querySelector('.ai-quick-row');
+    const _quickBox = panel.querySelector('.ai-quick-custom-box');
+    const _quickBoxInput = panel.querySelector('.ai-quick-custom-input');
+    const _inputRow = panel.querySelector('.ai-input-row');
+
+    function updateQuickUI() {
+        _quickRow.style.display = quick_custom_open ? 'none' : 'flex';
+        _quickRow.style.opacity = quick_busy ? '0.5' : '1';
+        _quickRow.style.pointerEvents = quick_busy ? 'none' : 'auto';
+        _quickBox.style.display = (quick_custom_open && !quick_busy) ? 'flex' : 'none';
+        _inputRow.style.display = (quick_custom_open || quick_busy) ? 'none' : 'flex';
+    }
+
+    function _quickDone() {
+        quick_busy = false;
+        quick_custom_open = false;
+        updateQuickUI();
+    }
+
+    function startQuick(message) {
+        quick_busy = true;
+        updateQuickUI();
+        const running = submitMessage(message);
+        // A bulk run is one promise covering every file: whatever way it ends, the
+        // box comes back. A single message comes back from its own answer/error handler.
+        if (running && running.finally) running.finally(() => { if (quick_busy) _quickDone(); });
+        else if (!is_ai_busy && !bulk_run_active) _quickDone();   // nothing was started
+    }
+
+    // "Create purchase invoice" needs a file: with none picked it shows a message and
+    // blinks the "Add invoice, image or PDF" button (it does not open the file chooser).
+    function _blinkAddFile() {
+        const add = panel.querySelector('.ai-file-add');
+        if (!add) return;
+        if (!document.getElementById('ai-blink-style')) {
+            const st = document.createElement('style');
+            st.id = 'ai-blink-style';
+            st.textContent = '@keyframes ai-blink{0%,100%{background:#fff;border-color:#94a3b8;box-shadow:none}' +
+                '50%{background:#fef3c7;border-color:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.35)}}' +
+                '.ai-file-add.ai-blink{animation:ai-blink .5s ease-in-out 4}';
+            document.head.appendChild(st);
+        }
+        add.classList.remove('ai-blink');
+        void add.offsetWidth;                       // restart the animation on repeat clicks
+        add.classList.add('ai-blink');
+        setTimeout(() => add.classList.remove('ai-blink'), 2100);
+    }
+    panel.querySelector('.ai-quick-pi').addEventListener('click', function () {
+        if (is_ai_busy || bulk_run_active) return;
+        if (!staged_files.length) {
+            frappe.show_alert({ message: __('Please attach the invoice file first, then tap Create purchase invoice.'), indicator: 'orange' });
+            _blinkAddFile();
+            return;
+        }
+        startQuick(AI_QUICK_CREATE_PI_MESSAGE);
+    });
+
+    // "Ask your own question": the box opens in place of the buttons and the question
+    // is typed and sent from there (picked files go with it).
+    panel.querySelector('.ai-quick-custom').addEventListener('click', function () {
+        quick_custom_open = true;
+        updateQuickUI();
+        _quickBoxInput.focus();
+    });
+    panel.querySelector('.ai-quick-custom-cancel').addEventListener('click', function () {
+        _quickBoxInput.value = '';
+        quick_custom_open = false;
+        updateQuickUI();
+    });
+    function sendCustomQuestion() {
+        const question = _quickBoxInput.value.trim();
+        if (!question || is_ai_busy || bulk_run_active) return;
+        _quickBoxInput.value = '';
+        startQuick(question);
+    }
+    panel.querySelector('.ai-quick-custom-send').addEventListener('click', sendCustomQuestion);
+    _quickBoxInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') sendCustomQuestion();
+        else if (e.key === 'Escape') panel.querySelector('.ai-quick-custom-cancel').click();
     });
 
     // ── Bulk invoice upload ──────────────────────────────────────────────────
@@ -1527,71 +1621,112 @@ function open_ai_panel() {
         });
     }
 
-    // File area under the chat: counts only on a phone, counts + a short
-    // scrollable list on desktop, so ten files never squeeze the chat.
-    function renderBulkStatus() {
+    // ── Picked files: ONE list. New picks are added to it and every file has its
+    // own X. syncStaged() derives the rest from it: one file is a normal single
+    // upload (image_data / image_mime), two or more become bulk_files, which
+    // runBulk reads one by one. ───────────────────────────────────────────────
+    const _attrEsc = s => _bulkEsc(s).replace(/"/g, '&quot;');
+    const _stagedIcon = s => ({ waiting: '⏳', reading: '🔄', ready: '✅', failed: '⚠️' })[s] || '';
+
+    function renderBulkStatus() { renderStaged(); }
+
+    function renderStaged() {
         const preview = panel.querySelector('.ai-file-preview');
-        const icon = { waiting: '⏳', reading: '🔄', ready: '✅', failed: '⚠️' };
-        const count = s => bulk_files.filter(f => f.status === s).length;
-        const reading = bulk_files.find(f => f.status === 'reading');
-        const list = is_mobile_view ? '' :
-            `<div style="max-height:96px;overflow:auto;margin-top:2px;">` +
-            bulk_files.map(f => `<div>${icon[f.status] || ''} ${_bulkEsc(f.name)}</div>`).join('') + `</div>`;
-        preview.innerHTML =
-            `<div style="font-weight:600;">${bulk_files.length} files selected${reading ? '' : '. Type your message and press Send.'}</div>` +
-            (reading ? `<div>Reading: ${_bulkEsc(reading.name)}</div>` : '') +
-            `<div>⏳ ${count('waiting')} · 🔄 ${count('reading')} · ✅ ${count('ready')} · ⚠️ ${count('failed')}</div>` +
-            list;
+        if (!staged_files.length) { preview.innerHTML = ''; return; }
+        const running = bulk_run_active;
+        const multi = staged_files.length > 1;
+        const count = s => staged_files.filter(f => f.status === s).length;
+        const reading = staged_files.find(f => f.status === 'reading');
+        const head = multi
+            ? `<div style="display:flex;align-items:center;gap:6px;">
+                   <div style="font-weight:600;flex:1;">${staged_files.length} files selected${running ? '' : '. Type your message and press Send.'}</div>
+                   ${running ? '<button class="ai-staged-stop btn btn-xs btn-danger" style="min-height:28px;">Stop</button>' : ''}
+               </div>` +
+              (reading ? `<div>Reading: ${_bulkEsc(reading.name)}</div>` : '') +
+              `<div>⏳ ${count('waiting')} · 🔄 ${count('reading')} · ✅ ${count('ready')} · ⚠️ ${count('failed')}</div>`
+            : '';
+        const rows = staged_files.map(f => {
+            const thumb = f.thumb
+                ? `<img class="ai-staged-thumb" src="${f.thumb}" title="Click to view full size" style="width:28px;height:28px;object-fit:cover;border-radius:4px;border:1px solid #e2e8f0;cursor:pointer;flex-shrink:0;">`
+                : `<span style="width:28px;text-align:center;flex-shrink:0;">📄</span>`;
+            return `<div class="ai-staged-row" style="display:flex;align-items:center;gap:6px;padding:2px 0;min-height:32px;">
+                ${thumb}
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#334155;">${multi ? _stagedIcon(f.status) + ' ' : ''}${_bulkEsc(f.name)}</span>
+                ${running ? '' : `<button class="ai-staged-x" data-id="${f.id}" title="Remove this file" aria-label="Remove ${_attrEsc(f.name)}" style="flex-shrink:0;width:28px;height:28px;line-height:1;border:none;border-radius:50%;background:#fee2e2;color:#b91c1c;font-size:16px;cursor:pointer;">×</button>`}
+            </div>`;
+        }).join('');
+        preview.innerHTML = head + `<div style="max-height:120px;overflow:auto;margin-top:2px;">${rows}</div>`;
+
+        preview.querySelectorAll('.ai-staged-x').forEach(b => b.addEventListener('click', () => removeStaged(b.getAttribute('data-id'))));
+        preview.querySelectorAll('.ai-staged-thumb').forEach(img => img.addEventListener('click', () => openAIImageLightbox(img.src)));
+        const stop = preview.querySelector('.ai-staged-stop');
+        if (stop) stop.addEventListener('click', () => { bulk_cancel = true; stop.disabled = true; stop.textContent = 'Stopping...'; });
     }
 
-    async function loadBulkFiles(picked, inputEl, preview) {
-        let files = picked;
-        if (files.length > BULK_MAX_FILES) {
-            frappe.msgprint(`Only the first ${BULK_MAX_FILES} files are used at a time.`);
-            files = files.slice(0, BULK_MAX_FILES);
+    function syncStaged() {
+        if (staged_files.length === 1) {
+            image_data = staged_files[0].data;
+            image_mime = staged_files[0].mime;
+            bulk_files = [];
+        } else {
+            image_data = null;
+            image_mime = null;
+            bulk_files = staged_files.length > 1 ? staged_files : [];
         }
-        image_data = null;
-        image_mime = null;
-        preview.textContent = `Processing ${files.length} files...`;
+        renderStaged();
+    }
 
-        const loaded = [];
+    function removeStaged(id) {
+        if (bulk_run_active) return;
+        staged_files = staged_files.filter(f => String(f.id) !== String(id));
+        if (!staged_files.length) panel.querySelector('.ai-file-input').value = '';
+        syncStaged();
+    }
+
+    async function readStagedFile(file) {
+        if (file.type === 'application/pdf') {
+            if (file.size > 10 * 1024 * 1024) {
+                frappe.msgprint(`${_bulkEsc(file.name)}: PDF too large (max 10MB), skipped.`);
+                return null;
+            }
+            return { id: ++_staged_seq, name: file.name, mime: 'application/pdf', data: await readFileAsBase64(file), thumb: '', status: 'waiting' };
+        }
+        if (file.type.startsWith('image/')) {
+            const data = await readFileAsBase64(await resizeImage(file));
+            return { id: ++_staged_seq, name: file.name, mime: 'image/jpeg', data: data, thumb: 'data:image/jpeg;base64,' + data, status: 'waiting' };
+        }
+        frappe.msgprint(`${_bulkEsc(file.name)}: only images and PDFs are supported, skipped.`);
+        return null;
+    }
+
+    async function addStagedFiles(picked) {
+        if (bulk_run_active) {
+            frappe.show_alert({ message: __('Please wait, the files are still being read.'), indicator: 'orange' });
+            return;
+        }
+        const room = BULK_MAX_FILES - staged_files.length;
+        if (room <= 0) {
+            frappe.msgprint(`Up to ${BULK_MAX_FILES} files can be added at a time. Remove one, or send these first.`);
+            return;
+        }
+        let files = picked;
+        if (files.length > room) {
+            frappe.msgprint(staged_files.length
+                ? `Only ${room} more file${room > 1 ? 's' : ''} can be added (max ${BULK_MAX_FILES} at a time).`
+                : `Only the first ${BULK_MAX_FILES} files are added (max ${BULK_MAX_FILES} at a time).`);
+            files = files.slice(0, room);
+        }
+        panel.querySelector('.ai-file-preview').textContent = `Processing ${files.length} file${files.length > 1 ? 's' : ''}...`;
         for (const file of files) {
             try {
-                if (file.type === 'application/pdf') {
-                    if (file.size > 10 * 1024 * 1024) {
-                        frappe.msgprint(`${_bulkEsc(file.name)}: PDF too large (max 10MB), skipped.`);
-                        continue;
-                    }
-                    loaded.push({ name: file.name, mime: 'application/pdf', data: await readFileAsBase64(file), status: 'waiting' });
-                } else if (file.type.startsWith('image/')) {
-                    const blob = await resizeImage(file);
-                    loaded.push({ name: file.name, mime: 'image/jpeg', data: await readFileAsBase64(blob), status: 'waiting' });
-                } else {
-                    frappe.msgprint(`${_bulkEsc(file.name)}: only images and PDFs are supported, skipped.`);
-                }
+                const entry = await readStagedFile(file);
+                if (entry) staged_files.push(entry);
             } catch (err) {
                 console.error('File error:', file.name, err);
                 frappe.msgprint(`${_bulkEsc(file.name)}: could not be processed, skipped.`);
             }
         }
-
-        if (loaded.length === 0) {
-            preview.textContent = '';
-            inputEl.value = '';
-            removeBtn.style.display = 'none';
-            return;
-        }
-        if (loaded.length === 1) {
-            // Only one usable file left: behave exactly like a normal single upload.
-            image_data = loaded[0].data;
-            image_mime = loaded[0].mime;
-            preview.textContent = `${loaded[0].mime === 'application/pdf' ? 'PDF' : 'Image'} ready: ${loaded[0].name}`;
-            removeBtn.style.display = 'inline-block';
-            return;
-        }
-        bulk_files = loaded;
-        renderBulkStatus();
-        removeBtn.style.display = 'inline-block';
+        syncStaged();
     }
 
     // One collapsed row per invoice. The full preview card (photo, editable form,
@@ -1752,8 +1887,8 @@ function open_ai_panel() {
         image_mime = null;
         bulk_current_name = '';
         bulk_files = [];
+        staged_files = [];
         fileInput.value = '';
-        removeBtn.style.display = 'none';
         panel.querySelector('.ai-file-preview').textContent = `Bulk upload finished: ${done} of ${files.length} read.`;
         bar.dataset.running = '0';
         _bulkRefreshBar(runId);
@@ -1783,15 +1918,15 @@ function open_ai_panel() {
     }
 
     function submitMessage(message) {
-        if (bulk_files.length > 1) { runBulk(message); return; }
+        if (bulk_files.length > 1) return runBulk(message);
         sendMessage(message);
     }
 
     // ── Item mapping on the Purchase Invoice preview ─────────────────────────
     // Every extracted item (and charge) name is compared with the ERPNext Item master
     // (match_items) so it can be mapped BEFORE the invoice is created:
-    //   95% or more   found automatically
-    //   70% to 95%    dropdown of similar items to map to (best preselected from 80%)
+    //   100%          found automatically
+    //   70% to 99%    dropdown of similar items to map to (best preselected from 80%)
     //   below 70%     "not in system" - Create warns exactly as before
     // The chosen Item code travels with the row as matched_item_code.
     const _escAttr = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -1838,13 +1973,27 @@ function open_ai_panel() {
         box.style.color = '#b45309';
         const opts = (res.status === 'suggest' ? '<option value="">Select the matching item...</option>' : '') +
             cands.map((c, i) => `<option value="${_escAttr(c.code)}"${res.status === 'pick' && i === 0 ? ' selected' : ''}>${_escAttr(c.label)}</option>`).join('');
-        box.innerHTML = '<div>Not an exact match. Map it to an item in your system:</div>' +
+        box.innerHTML = '<div class="ai-item-msg">Not an exact match. Map it to an item in your system:</div>' +
             `<select style="width:100%;font-size:11px;padding:2px 4px;margin-top:2px;border:1px solid #f59e0b;border-radius:3px;background:#fffbeb;">${opts}</select>`;
         const sel = box.querySelector('select');
+        const msg = box.querySelector('.ai-item-msg');
         if (sel.value) tr.dataset.matched = sel.value;
         sel.addEventListener('change', () => {
-            if (sel.value) tr.dataset.matched = sel.value;
-            else delete tr.dataset.matched;
+            // once the user picks an item it reads as "In system" (like an exact match); the dropdown
+            // stays so it can be switched again, and choosing the blank option goes back to the warning
+            if (sel.value) {
+                tr.dataset.matched = sel.value;
+                box.style.color = '#16a34a';
+                msg.textContent = '✓ In system: ' + sel.options[sel.selectedIndex].text;
+                sel.style.borderColor = '#16a34a';
+                sel.style.background = '#f0fdf4';
+            } else {
+                delete tr.dataset.matched;
+                box.style.color = '#b45309';
+                msg.textContent = 'Not an exact match. Map it to an item in your system:';
+                sel.style.borderColor = '#f59e0b';
+                sel.style.background = '#fffbeb';
+            }
             _syncMatchesToPi(wrapper);
         });
     }
@@ -1864,7 +2013,10 @@ function open_ai_panel() {
                 }
             },
             error: function () {
-                rows.forEach(tr => { const b = tr.querySelector(`.${pid}-match`); if (b) b.textContent = ''; });
+                rows.forEach(tr => {
+                    const b = tr.querySelector(`.${pid}-match`);
+                    if (b) { b.style.color = '#b45309'; b.textContent = 'Could not check this item. Please try again.'; }
+                });
             }
         });
     }
@@ -1876,81 +2028,151 @@ function open_ai_panel() {
             if (box) { box.style.color = '#94a3b8'; box.textContent = 'Checking item...'; }
         });
         _matchItemRows(wrapper, pid, rows);
-        // an edited name is matched again (only that row, so other choices are kept)
+        // Typing in the item name box searches the whole Item list (backend_item_search); the closest-match
+        // result above stays until a search is made. Picking a result tags that item to the row.
         wrapper.querySelectorAll('[data-f="item_name"]').forEach(inp => {
             let timer = null;
             inp.addEventListener('input', () => {
                 const tr = inp.closest('tr');
-                delete tr.dataset.matched;
-                _syncMatchesToPi(wrapper);
+                const box = tr.querySelector(`.${pid}-match`);
+                let list = tr.querySelector('.ai-item-results');
+                if (!list) {
+                    list = document.createElement('div');
+                    list.className = 'ai-item-results';
+                    list.style.cssText = 'margin-top:2px;border:1px solid #cbd5e1;border-radius:3px;background:#fff;max-height:150px;overflow-y:auto;font-size:11px;color:#334155;';
+                    box.insertAdjacentElement('afterend', list);
+                }
                 clearTimeout(timer);
-                timer = setTimeout(() => _matchItemRows(wrapper, pid, [tr]), 700);
+                const q = inp.value.trim();
+                if (!q) { list.remove(); return; }
+                timer = setTimeout(() => {
+                    frappe.call({
+                        method: 'pilot_assist.api.item_search.backend_item_search',
+                        args: { doctype: 'Item', txt: q, searchfield: 'name', start: 0, page_len: 15,
+                                filters: { has_variants: 0, disabled: 0 }, fields: ['name', 'item_name', 'stock_uom'] },
+                        callback: function (r) {
+                            if (inp.value.trim() !== q) return;          // a newer search is running
+                            const found = (r && r.message) || [];
+                            list.innerHTML = found.length
+                                ? found.map(f => `<div class="ai-item-result" data-code="${_escAttr(f.name)}" data-label="${_escAttr(f.item_name || f.name)}" style="padding:3px 6px;cursor:pointer;border-bottom:1px solid #f1f5f9;">${_escAttr(f.item_name || f.name)}</div>`).join('')
+                                : '<div style="padding:3px 6px;color:#94a3b8;">No item found</div>';
+                            list.querySelectorAll('.ai-item-result').forEach(el => {
+                                el.addEventListener('mouseenter', () => { el.style.background = '#eff6ff'; });
+                                el.addEventListener('mouseleave', () => { el.style.background = ''; });
+                                el.addEventListener('click', () => {
+                                    tr.dataset.matched = el.dataset.code;
+                                    inp.value = el.dataset.label;
+                                    box.style.color = '#16a34a';
+                                    box.textContent = '✓ In system: ' + el.dataset.label;
+                                    list.remove();
+                                    _syncMatchesToPi(wrapper);
+                                });
+                            });
+                        }
+                    });
+                }, 400);
             });
         });
     }
 
-    // File upload
-    const fileInput = panel.querySelector('.ai-file-input');
-    const removeBtn = panel.querySelector('.ai-file-remove');
+    // Supplier: the preview says only whether it is in the system (exact name). Typing in the Supplier box
+    // searches Suppliers (Frappe search_link); picking one tags it, and Create uses the tagged supplier.
+    function _syncSupplierToPi(wrapper) {
+        const btn = wrapper.querySelector('.ai-create-pi-btn');
+        if (!btn) return;
+        let pi;
+        try { pi = JSON.parse(btn.getAttribute('data-pi')); } catch (e) { return; }
+        if (!pi.mapped_data) return;
+        if (wrapper.dataset.supplier) pi.mapped_data.matched_supplier = wrapper.dataset.supplier;
+        else delete pi.mapped_data.matched_supplier;
+        btn.setAttribute('data-pi', JSON.stringify(pi));
+    }
 
+    function _initSupplierMatching(wrapper, pid) {
+        const inp = wrapper.querySelector(`#${pid}-supplier`);
+        if (!inp) return;
+        const box = document.createElement('div');
+        box.className = 'ai-supplier-match';
+        box.style.cssText = 'font-size:10px;margin-top:2px;color:#94a3b8;';
+        inp.insertAdjacentElement('afterend', box);
+        const setFound = (code, label) => {
+            wrapper.dataset.supplier = code;
+            box.style.color = '#16a34a';
+            box.textContent = '✓ In system: ' + label;
+            _syncSupplierToPi(wrapper);
+        };
+        const setMissing = () => {
+            delete wrapper.dataset.supplier;
+            box.style.color = '#dc2626';
+            box.textContent = 'Not in system. Type to search the suppliers.';
+            _syncSupplierToPi(wrapper);
+        };
+        const check = (text) => {
+            if (!text.trim()) { setMissing(); return; }
+            box.style.color = '#94a3b8';
+            box.textContent = 'Checking supplier...';
+            frappe.call({
+                method: 'pilot_assist.api.ai_api.check_supplier',
+                args: { name: text },
+                callback: function (r) {
+                    if (inp.value.trim() !== text.trim()) return;
+                    const m = r && r.message;
+                    if (m && m.found) setFound(m.name, m.supplier_name || m.name); else setMissing();
+                },
+                error: function () { box.style.color = '#b45309'; box.textContent = 'Could not check this supplier. Please try again.'; }
+            });
+        };
+        check(inp.value);
+
+        let timer = null;
+        let list = null;
+        const closeList = () => { if (list) { list.remove(); list = null; } };
+        inp.addEventListener('input', () => {
+            delete wrapper.dataset.supplier;
+            _syncSupplierToPi(wrapper);
+            clearTimeout(timer);
+            const q = inp.value.trim();
+            if (!q) { closeList(); setMissing(); return; }
+            box.style.color = '#b45309';
+            box.textContent = 'Pick the supplier from the list.';
+            timer = setTimeout(() => {
+                frappe.call({
+                    method: 'frappe.desk.search.search_link',
+                    args: { doctype: 'Supplier', txt: q, page_length: 10 },
+                    callback: function (r) {
+                        if (inp.value.trim() !== q) return;
+                        const found = (r && r.message) || [];
+                        closeList();
+                        list = document.createElement('div');
+                        list.className = 'ai-supplier-results';
+                        list.style.cssText = 'margin-top:2px;border:1px solid #cbd5e1;border-radius:3px;background:#fff;max-height:150px;overflow-y:auto;font-size:11px;color:#334155;';
+                        list.innerHTML = found.length
+                            ? found.map(f => `<div class="ai-supplier-result" data-code="${_escAttr(f.value)}" style="padding:3px 6px;cursor:pointer;border-bottom:1px solid #f1f5f9;">${_escAttr(f.value)}</div>`).join('')
+                            : '<div style="padding:3px 6px;color:#94a3b8;">No supplier found</div>';
+                        box.insertAdjacentElement('afterend', list);
+                        list.querySelectorAll('.ai-supplier-result').forEach(el => {
+                            el.addEventListener('mouseenter', () => { el.style.background = '#eff6ff'; });
+                            el.addEventListener('mouseleave', () => { el.style.background = ''; });
+                            el.addEventListener('click', () => {
+                                inp.value = el.dataset.code;
+                                setFound(el.dataset.code, el.dataset.code);
+                                closeList();
+                            });
+                        });
+                    }
+                });
+            }, 400);
+        });
+    }
+
+    // File upload: every pick is ADDED to the list above (see syncStaged)
+    const fileInput = panel.querySelector('.ai-file-input');
     fileInput.addEventListener('change', async function (e) {
         const picked = Array.from(e.target.files || []);
-        const preview = panel.querySelector('.ai-file-preview');
-        bulk_files = [];
-        if (picked.length > 1) {
-            await loadBulkFiles(picked, e.target, preview);
-            return;
-        }
-        const file = picked[0];
-        if (!file) { image_data = null; image_mime = null; preview.textContent = ''; removeBtn.style.display = 'none'; return; }
-
-        preview.textContent = 'Processing...';
-        try {
-            if (file.type === 'application/pdf') {
-                if (file.size > 10 * 1024 * 1024) { frappe.msgprint("PDF too large. Max 10MB."); e.target.value = ''; return; }
-                image_mime = 'application/pdf';
-                image_data = await new Promise((resolve) => {
-                    let reader = new FileReader();
-                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                    reader.readAsDataURL(file);
-                });
-                preview.textContent = `PDF ready: ${file.name}`;
-                removeBtn.style.display = 'inline-block';
-            } else if (file.type.startsWith('image/')) {
-                let blob = await resizeImage(file);
-                image_mime = 'image/jpeg';
-                image_data = await new Promise((resolve) => {
-                    let reader = new FileReader();
-                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                    reader.readAsDataURL(blob);
-                });
-                preview.innerHTML = `
-                    <img src="data:image/jpeg;base64,${image_data}" class="ai-img-thumb"
-                        style="max-height:48px;border-radius:4px;cursor:pointer;border:1px solid #e2e8f0;vertical-align:middle;"
-                        title="Click to view full size">
-                    <span style="vertical-align:middle;margin-left:6px;font-size:11px;color:#555;">${file.name}</span>`;
-                removeBtn.style.display = 'inline-block';
-                preview.querySelector('.ai-img-thumb').addEventListener('click', () =>
-                    openAIImageLightbox(`data:image/jpeg;base64,${image_data}`)
-                );
-            } else {
-                frappe.msgprint("Only images and PDFs are supported.");
-                e.target.value = '';
-            }
-        } catch (err) {
-            console.error("File error:", err);
-            preview.textContent = 'Error processing file.';
-        }
-    });
-
-    removeBtn.addEventListener('click', function () {
-        bulk_files = [];
-        bulk_cancel = true;
-        image_data = null;
-        image_mime = null;
-        fileInput.value = '';
-        panel.querySelector('.ai-file-preview').textContent = '';
-        removeBtn.style.display = 'none';
+        // Reset so the same file can be picked again after it was removed; the list
+        // under the button, not this input, is what holds the files.
+        e.target.value = '';
+        if (picked.length) await addStagedFiles(picked);
     });
 }
 
