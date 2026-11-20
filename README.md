@@ -105,6 +105,13 @@ All are POST requests to `/api/method/<path>` with `Authorization: token <api_ke
 | `pilot_assist.api.ai_api.create_quotation_from_data` | Creates a Quotation from mapped data. |
 | `pilot_assist.api.ai_api.speech_to_text` | Audio (base64 webm) in, English text out. |
 
+`pilot_assist.api.ai_api.read_po_image(file_b64, mime)` is **not** an API: it is a plain Python function other apps on the same
+site import (it is not whitelisted, so it cannot be called over HTTP). It reads the product rows off a customer purchase order
+(JPG, PNG or PDF) and returns the model's JSON text -- no MCP, no tools, no user or role check, and a fixed prompt. The file is
+prepared as `ask_document` prepares an invoice for the same provider (Gemini/Claude: photo to OCR'd PDF; DeepSeek: Docling text).
+It uses the image provider and model; set `enable_ai_assistant.ai_provider_po_model` to give POs their own model without
+changing the invoice flow.
+
 ## Using with erpnext_enhancements
 
 erpnext_enhancements contains its own copy of this assistant. If both apps are installed on one site, only one chat button appears (whichever app's script loads first), and the site config is shared. Prefer installing only one of them per site.
