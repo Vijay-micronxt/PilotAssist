@@ -1616,6 +1616,117 @@ def _ai_single_completion(prompt):
     frappe.throw(_(f"Unknown ai_provider '{ai_provider}'. Valid: gemini, claude, openrouter, bedrock, kimi, glm, deepseek"))
 
 
+# ─── Reading a customer purchase order (called by other apps, not by the chat widget) ─────────────
+
+_PO_READ_SYSTEM_PROMPT = """You read a customer's purchase order (PO) that was sent as a photo, a scan or a PDF.
+Return ONLY one JSON object, no commentary and no markdown fences, in exactly this shape:
+{"po_number": string or null, "po_date": "YYYY-MM-DD" or null,
+ "lines": [{"code": string or null, "description": string or null, "qty": number or null, "unit": string or null}]}
+
+Rules:
+- One entry in "lines" per ordered product row, in the order printed. Skip headers, totals, taxes, freight, terms and signatures.
+- "code" is the item code or SKU exactly as printed on that row (keep letters, digits, dashes and spaces). null when the row has none.
+- "description" is the product name or description exactly as printed. null when the row has none.
+- "qty" is the ordered quantity as a plain number, without units or thousands separators. null when it is missing or you cannot read it.
+- "unit" is the unit printed next to the quantity (for example Box, Pcs, Sqft, Sqm), or null when none is printed.
+- Never invent, guess or "correct" a value. If a code or number is not clearly legible, use null for it rather than a best guess.
+- If the document is not a purchase order or has no product rows, return {"po_number": null, "po_date": null, "lines": []}."""
+
+
+def read_po_image(file_b64, mime):
+    """Raw JSON text of the product rows on a customer PO photo/scan/PDF, for another app to parse.
+
+    Deliberately NOT whitelisted: it is a plain function other apps import on the same site, so it
+    cannot be reached over HTTP, and it does no user, role or MCP work -- the chat flow needs those
+    to read ERP data through tools; reading a document needs none. Nothing is passed to the model
+    but the file and a fixed prompt (no tools, no ERP data, no expected items), so it reads what is
+    printed rather than what the caller hoped to find.
+
+    The file is prepared exactly as ask_document prepares an invoice for the same provider:
+      * Gemini / Claude read PDFs; a JPG/PNG is first made into an OCR'd PDF (img2pdf + ocrmypdf
+        deskew phone photos and add a text layer) and that is sent. If the conversion fails the
+        photo is sent as it is.
+      * DeepSeek / OpenRouter / Kimi / GLM take images only: with Docling configured a PDF or photo
+        goes in as Markdown text; without it a PDF is refused and a photo is sent as it is.
+    Provider and model are the site's image provider and model (ai_provider_image and
+    ai_provider_image_model), unless ai_provider_po_model is set, which changes only this call so
+    the invoice flow keeps its model. Raises on missing configuration or a provider error."""
+    import base64
+
+    ai_provider = _pick_ai_provider(has_image=True)
+    model_override = _ai_conf("ai_provider_po_model") or _pick_ai_model(has_image=True)
+    task = "Read this purchase order and return the JSON object described."
+    photo_mimes = {"image/jpeg", "image/jpg", "image/png"}
+
+    if ai_provider in _OPENAI_COMPATIBLE:
+        text = None
+        if ai_provider == "deepseek" and _docling_configured():
+            pdf_b64 = file_b64 if mime == "application/pdf" else (_photo_to_pdf(file_b64, mime, ocr=False) if mime in photo_mimes else None)
+            text = _docling_pdf_to_text(pdf_b64) if pdf_b64 else None
+        if text:
+            task = f"{task}\n\nThe document was converted to text (tables as Markdown):\n\n{text}"
+            file_b64 = mime = None
+        elif mime == "application/pdf":
+            frappe.throw(_("{0} cannot read PDF files and no text converter is set up. Send the PO as a JPG or PNG photo, "
+                           "or set the image provider to Gemini or Claude.").format(ai_provider.title()))
+    elif mime in photo_mimes:
+        pdf_b64 = _photo_to_pdf(file_b64, mime)
+        if pdf_b64:
+            file_b64, mime = pdf_b64, "application/pdf"
+
+    if ai_provider == "gemini":
+        keys = _gemini_key_list()
+        if not keys:
+            frappe.throw(_("gemini_api_keys not configured in site_config.json"))
+        model = model_override or _ai_conf("gemini_model") or "gemini-flash-lite-latest"
+        from google.genai import types
+
+        parts = [types.Part.from_text(text=f"{_PO_READ_SYSTEM_PROMPT}\n\n{task}")]
+        if file_b64 and mime:
+            parts.insert(0, types.Part.from_bytes(data=base64.b64decode(file_b64), mime_type=mime))
+        response = _gemini_generate_with_rotation(
+            keys, model, [types.Content(role="user", parts=parts)],
+            types.GenerateContentConfig(temperature=0.1, response_mime_type="application/json"),
+        )
+        return response.text or ""
+
+    if ai_provider == "claude":
+        keys = _claude_key_list()
+        if not keys:
+            frappe.throw(_("claude_api_keys not configured in site_config.json"))
+        model = model_override or "claude-haiku-4-5-20251001"
+        content = []
+        if file_b64 and mime == "application/pdf":
+            content.append({"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": file_b64}})
+        elif file_b64 and mime:
+            content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg" if mime == "image/jpg" else mime, "data": file_b64}})
+        content.append({"type": "text", "text": task})
+        response = _claude_create(
+            keys, [{"role": "user", "content": content}],
+            {"model": model, "max_tokens": 8192, "temperature": 0.1, "system": _PO_READ_SYSTEM_PROMPT},
+        )
+        return "".join(block.text for block in response.content if hasattr(block, "text"))
+
+    if ai_provider in _OPENAI_COMPATIBLE:
+        _key_field, model_field, default_model, _url = _OPENAI_COMPATIBLE[ai_provider]
+        keys = _oai_key_list(ai_provider)
+        if not keys:
+            frappe.throw(_("{0}_api_keys not configured in site_config.json").format(ai_provider))
+        model = model_override or frappe.conf.get(model_field) or default_model
+        user_content = task
+        if file_b64 and mime:
+            user_content = [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{file_b64}"}}, {"type": "text", "text": task}]
+        resp = _oai_post(ai_provider, keys, {
+            "model": model,
+            "messages": [{"role": "system", "content": _PO_READ_SYSTEM_PROMPT}, {"role": "user", "content": user_content}],
+        })
+        if resp.status_code != 200:
+            frappe.throw(_("AI provider error: {0}").format(resp.text[:300]))
+        return resp.json()["choices"][0]["message"].get("content", "") or ""
+
+    frappe.throw(_("Reading a PO is not supported for the '{0}' provider. Use gemini, claude or deepseek.").format(ai_provider))
+
+
 # ─── Main entry point (router) ────────────────────────────────────────────────
 
 @frappe.whitelist()
